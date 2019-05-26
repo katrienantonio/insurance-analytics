@@ -1,0 +1,548 @@
+---
+title: 'Tree-based machine learning for insurance pricing'
+author: 'Roel Henckaerts, Katrien Antonio'
+date: 'May, 2019'
+output:
+  html_document:
+    theme: spacelab
+    toc: true
+    toc_float: true
+graphics: yes
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(cache = TRUE)
+```
+
+# Goal of this demo
+
+This demo demonstrates a use case of tree-based machine learning for insurance pricing. We cover different types of models, namely regression trees, random forests and gradient boosting machines. The demo covers the fitting of these models in R and shows how to generate predictions from the fitted models. This tutorial also contains the basic concepts of cross-validation and demonstrates cross-validation to find optimal tuning parameters. Next we cover some interpretation tools, such as variable importance, partial dependence plots (PDPs) and individual conditional expectations (ICEs). To wrap up, this demo contains some final words on the economic value of the developed models.
+
+Note: the demo uses the version of `rpart` available from Roel Henckaerts' GitHub page, and the version of `gbm` available from Harry Southworth's GitHub. Best is to install both packages before starting the tutorial, using instructions similar to the chunk printed below. The tutorial assumes you managed to install both packages from the respective GitHub sources.
+
+```{r get_rpart_gbm, eval=F}
+# remove.packages('rpart')
+# install.packages(devtools)
+# library(devtools)
+# devtools::install_github('RoelHenckaerts/distRforest', dependencies = TRUE, INSTALL_opts = c('--no-lock'))
+# library(rpart)
+# remove.packages('gbm')
+# install_github("harrysouthworth/gbm", dependencies = TRUE, INSTALL_opts = c('--no-lock'))
+# library(gbm)
+```
+
+# Data and predictors
+
+We start by importing the `data.table` package and loading the MTPL data:
+
+```{r mtpl_data}
+path <- file.path('C:/Users/u0043788/Dropbox/IIR Machine learning en Data Science opleiding/R demos/Gradient boosting')
+path.MTPL <- file.path(path, "P&Cdata.txt")
+data <- read.table(path.MTPL, header = TRUE)
+data <- as.data.frame(data)
+```
+
+In a next step we gather all the predictor variables in a character vector for later use:
+
+```{r predictors}
+predictors <- c('COVERAGE', 'AGEPH', 'SEX', 'BM', 'POWER', 'AGEC', 'FUEL', 'USE', 'FLEET', 'LONG', 'LAT')
+```
+
+# Modeling with trees
+
+This section demonstrates the fitting of different tree-based models with R.
+
+## Regression tree
+
+Regression trees are fitted with the R package `rpart` available on CRAN, so we need to load this package. However, since we also want to fit a tree for claim severity, using the gamma deviance as the loss function, you need the extended `rpart` package, available from Roel's GitHub page: <https://github.com/RoelHenckaerts/distRforest>.
+
+```{r get_rpart_Roel, eval=FALSE}
+# remove.packages('rpart')
+# install.packages(devtools)
+# devtools::install_github('RoelHenckaerts/distRforest', dependencies = TRUE, INSTALL_opts = c('--no-lock'))
+# library(rpart)
+```
+
+We start by fitting a regression tree for claim frequency:
+
+```{r frequency tree}
+library(rpart)
+# efficient way to specify the model formula
+as.formula(paste('cbind(EXP, NCLAIMS)', '~', paste(predictors, collapse=' + ')))
+tree_freq <- rpart(formula = as.formula(paste('cbind(EXP, NCLAIMS)',
+                                              '~',
+                                              paste(predictors,collapse=' + '))), 
+                   data = data, 
+                   method = 'poisson', 
+                   parms = list(shrink = 0.125),
+                   control = rpart.control(cp = 1.3e-04,
+                                           xval = 0,
+                                           maxcompete = 0,
+                                           maxsurrogate = 0,
+                                           minbucket = 0.01*nrow(data)))
+print(tree_freq)
+```
+
+Now you are ready to build a regression tree with gamma deviance as loss function.
+```{r severity tree}
+tree_sev <- rpart(formula = as.formula(paste('AVG',
+                                             '~',
+                                             paste(predictors, collapse = ' + '))),
+                  data = data[!is.na(data$AVG), ],
+                  method = 'gamma',
+                  weights = NCLAIMS,
+                  control = rpart.control(cp = 5.2e-03,
+                                          xval = 0,
+                                          maxcompete = 0,
+                                          maxsurrogate = 0,
+                                          minbucket = 0.01*nrow(data[!is.na(data$AVG), ])))
+print(tree_sev)
+```
+
+Once we fitted these models we can use them to obtain predictions for claim frequency and severity. When predicting claim frequencies it is important (throughout the tutorial) that are `predict` functions for `rpart` and `gbm` can give predicted values at the response level, but they do not take exposure into account! 
+
+```{r predict tree}
+pred_tree_freq <- predict(tree_freq, data)
+head(pred_tree_freq)
+pred_tree_sev <- predict(tree_sev, data)
+head(pred_tree_sev)
+```
+
+## Random forest
+
+Again, for this part you need the extended `rpart` package, available from Roel's GitHub page: <https://github.com/RoelHenckaerts/distRforest>.
+
+We start by fitting a random forest for claim frequency. Note that the `rforest` function in Roel's `rpart` package takes a so-called `data.table` (instead of a `data.frame`) as input. `data.table` is an `R` package specifically oriented to data manipulation with large/big data sets. It outperforms the `tidyverse` and the base `R` functionalities when it comes to operations on large/big data sets. 
+
+Tuning parameters when fitting a random forest are the number of trees (`ntrees`) grown and the number of split candidates (`ncand`). As explained in the Henckaerts et al. (2019) paper, a random forest aggregates the results of $T$ decision trees, each tree $t$ grown on a bootstrap copy $\mathcal{D}_t$ of the original training set. The trees are typically grown deep (i.e. `cp = 0`, until a stopping criterion is satisfied. Taking bootstrap samples of smaller sizes $\delta \cdot n$, with $n$ the number of observations in the training sample and $0< \delta < 1$ (below denoted as `subsample`), decorrelates the trees further and reduces the model training time. A random forest
+further decorrelates the individual trees by sampling predictors during the growing process. At each split, `ncand` out of the complete set of predictor variables are randomly chosen as candidates for the optimal
+splitting variable. This random sampling prevents that some variables dominate the splits in all trees.
+
+```{r frequency_rf}
+library(data.table)
+data <- as.data.table(data)
+rf_freq <- rforest(formula = as.formula(paste('cbind(EXP, NCLAIMS)',
+                                              '~',
+                                              paste(predictors,collapse=' + '))),
+                   data = data,
+                   method = 'poisson',
+                   parms = list(shrink = 1),
+                   ncand = 5,
+                   ntrees = 1000,
+                   subsample = 0.75,
+                   redmem = TRUE,
+                   control = rpart.control(cp = 0,
+                                           xval = 0,
+                                           maxcompete = 0,
+                                           maxsurrogate = 0,
+                                           minbucket = 0.75*0.01*nrow(data)))
+```
+
+We also fit a random forest for claim severity:
+
+```{r severity_rf}
+rf_sev <- rforest(formula = as.formula(paste('AVG',
+                                             '~',
+                                             paste(predictors,collapse=' + '))),
+                  data = data[!is.na(data$AVG), ],
+                  method = 'gamma',
+                  weights = NCLAIMS,
+                  ncand = 2,
+                  ntrees = 300,
+                  subsample = 0.75,
+                  redmem = TRUE,
+                  control = rpart.control(cp = 0,
+                                          xval = 0,
+                                          maxcompete = 0,
+                                          maxsurrogate = 0,
+                                          minbucket = 0.75*0.01*nrow(data[!is.na(data$AVG), ])))
+```
+
+Once we fitted these models we can use them to obtain predictions for claim frequency and severity. When predicting claim frequencies it is important (throughout the tutorial) that are `predict` functions for `rpart` and `gbm` can give predicted values at the response level, but they do not take exposure into account! 
+
+```{r predict rf v1}
+pred_rf_freq <- rowMeans(sapply(1:length(rf_freq),
+                                function(i) predict(rf_freq[[i]], data)))
+head(pred_rf_freq)
+pred_rf_sev <- rowMeans(sapply(1:length(rf_sev),
+                               function(i) predict(rf_sev[[i]], data)))
+head(pred_rf_sev)
+```
+
+Another way to predict from the random forest is the following:
+
+```{r predict rf v2}
+pred <- rep(0,nrow(data))
+for(i in 1:length(rf_freq)) pred <- pred + (1/length(rf_freq))*predict(rf_freq[[i]], data)
+```
+
+Both approaches are equal up to machine precision:
+
+```{r equal}
+all(abs(pred - pred_rf_freq) <= 1e-15)
+```
+
+## Gradient boosting machine
+
+For the Gamma distribution you need the `gbm` package available from: <https://github.com/harrysouthworth/gbm>. Therefore, we will use this version of `gbm` instead of the one available on CRAN.
+
+```{r gbm, warning=FALSE, message=FALSE, eval = F}
+# remove.packages("gbm")
+# install.packages("devtools")
+# library(devtools)
+# install_github("harrysouthworth/gbm", dependencies = TRUE, INSTALL_opts = c('--no-lock'))
+# library(gbm)
+```
+
+We start by fitting a gbm for claim frequency:
+
+```{r frequency gbm}
+library(gbm)
+gbm_freq <- gbm(formula = as.formula(paste('NCLAIMS',
+                                           '~',
+                                           paste(predictors,collapse=' + '),
+                                           '+ offset(log(EXP))')),
+                distribution = 'poisson',
+                data = data,
+                var.monotone = rep(0,length(predictors)),
+                n.trees = 2000,
+                interaction.depth = 4,
+                shrinkage = 0.01,
+                bag.fraction = 0.75,
+                n.minobsinnode = 0.75*0.01*nrow(data),
+                verbose = FALSE,
+                n.cores = 1)
+```
+
+We also fit a gbm for claim severity:
+
+```{r severity gbm}
+gbm_sev <- gbm(formula = as.formula(paste('AVG',
+                                         '~',
+                                         paste(predictors, collapse=' + '))),
+              distribution = 'gamma',
+              data = data[!is.na(data$AVG),],
+              weights = NCLAIMS,
+              var.monotone = rep(0,length(predictors)), 
+              n.trees = 500,
+              interaction.depth = 1,
+              shrinkage = 0.01, 
+              bag.fraction = 0.75,
+              n.minobsinnode = 0.75*0.01*nrow(data[!is.na(data$AVG),]),
+              verbose = FALSE,
+              n.cores = 1)
+```
+
+Once we fitted these models we can use them to obtain predictions for claim frequency and severity. When predicting claim frequencies it is important (throughout the tutorial) that are `predict` functions for `rpart` and `gbm` can give predicted values at the response level, but they do not take exposure into account! 
+
+```{r predict gbm, warning=FALSE}
+pred_gbm_freq <- predict(gbm_freq, data, type = 'response', n.trees = gbm_freq$n.trees)
+head(pred_gbm_freq)
+pred_gbm_sev <- predict(gbm_sev, data, type = 'response', n.trees = gbm_sev$n.trees)
+head(pred_gbm_sev)
+```
+
+# Cross-validation basics
+
+The parameters for the regression trees, random forests and gradient boosting machines in the previous sections are set to a certain unmotivated value. The choice of these values is motivated in the paper [https://arxiv.org/abs/1904.10890](Boosting insights in insurance tariff plans with tree-based machine learning) by Roel Henckaerts, Katrien Antonio, Marie-Pier Côté (Université de Laval, Canada) and Roel Verbelen and they are optimised to obtain good performance. This process is called tuning and is typically done through cross-validation over a predefined grid of tuning parameter values.
+
+## Creating data folds
+
+We start by creating a fold indicator. The data is sorted in the number of claims, the average payment amount and the exposure measure. This guarantees that we obtain stratified data folds with a similar distribution of the response variable in each fold.
+
+```{r folds}
+K_folds <- 6
+data <- data[order(data$NCLAIMS, data$AVG, data$EXP),]
+data$fold <- paste0('data', rep(1:K_folds, length = nrow(data)))
+head(data)
+```
+
+We can calculate the mean of the number of claims and the average payment by fold to see whether the stratification worked:
+
+```{r strat_stats}
+library(dplyr)
+data %>% group_by(fold) %>% 
+  summarize(emp_claim_freq = sum(NCLAIMS)/n())
+data %>% na.omit() %>% group_by(fold) %>% 
+  summarize(emp_claim_sev = sum(AVG)/n())
+data %>% filter(!is.na(AVG)) %>% group_by(fold) %>% 
+  summarize(emp_claim_sev = sum(AVG)/n())
+data %>% filter(complete.cases(.)) %>% group_by(fold) %>% 
+  summarize(emp_claim_sev = sum(AVG)/n())
+```
+
+Now we can use the fold indicator to split up the data in a training, validation and test set:
+
+```{r split1}
+test_data <- data[fold == 'data1', ]
+valid_data <- data[fold == 'data2', ]
+train_data <- data[!(fold %in% c('data1','data2')), ]
+```
+
+A next iteration in the cross-validation scheme will choose another validation set like this:
+
+```{r split2}
+test_data <- data[fold == 'data1', ]
+valid_data <- data[fold == 'data3', ]
+train_data <- data[!(fold %in% c('data1','data3')), ]
+```
+
+And so on for 'data4', 'data5' and 'data6'. This will result in 5-fold cross-validation with fold 'data1' as hold-out test set.
+
+## Evaluation functions
+
+For finding the optimal tuning parameters through cross-validation we need an evaluation function. For claim frequency we will use the Poisson deviance, while for claim severity we will use the Gamma deviance:
+
+```{r poiss_dev}
+#' Calculate the Poisson deviance
+#' @param y The true values (numeric vector)
+#' @param yhat The estimates for y (numeric vector)
+#' @param w Optional case weights (numeric vector)
+#' @param scaled Deviance scaled by number of observations or not (boolean)
+#' @return A single number containing the Poisson deviance
+poiss_dev <- function(y, yhat, w = 1, scaled = TRUE){
+  sf <- ifelse(scaled, 1/length(y[!is.na(y)]), 1)
+  return(-2*sf*sum(w*(dpois(y,yhat,log=TRUE) - dpois(y,y,log=TRUE)), na.rm = TRUE))
+}
+```
+
+```{r gamma_dev}
+#' Calculate the Gamma deviance
+#' @param y The true values (numeric vector)
+#' @param yhat The estimates for y (numeric vector)
+#' @param w Optional case weights (numeric vector)
+#' @param scaled Deviance scaled by number of observations or not (boolean)
+#' @return A single number containing the gamma deviance
+gamma_dev <- function(y, yhat, w = 1, scaled = TRUE){
+  sf <- ifelse(scaled, 1/length(y[!is.na(y)]), 1)
+  return(-2*sf*sum(w*(log(y/yhat) - (y - yhat)/yhat), na.rm = TRUE))
+}
+```
+
+## Full example
+
+The next example demonstrates the full cross-validation process for a claim frequency regression tree:
+
+```{r cross_val}
+cp_grid <- as.vector(outer(1:9,10^(-5:-3))) # 1e-05 ... 9e-05 1e-04 ... 9e-04 1e-03 ... 9e-03
+cv_perf <- rep(0, length(cp_grid)) # empty vector to store results over cp values
+test_fold <- 'data1'
+val_folds <- c('data2','data3','data4','data5','data6')
+for(cp in cp_grid){
+  cp_perf <- rep(0, length(val_folds)) # empty vector to store results over val folds
+  for(val_fold in val_folds){
+    train_data <- data[!(data$fold %in% c(test_fold, val_fold)), ]
+    val_data <- data[data$fold == val_fold, ]
+    tree_fit <- rpart(formula = as.formula(paste('cbind(EXP, NCLAIMS)','~',paste(predictors,collapse=' + '))), 
+                      data = train_data, # only use training data
+                      method = 'poisson', 
+                      control = rpart.control(cp = cp, # use the current cp value from the grid
+                                              xval = 0, 
+                                              maxcompete = 0, 
+                                              maxsurrogate = 0, 
+                                              minbucket = 1000)) 
+    tree_pred <- predict(tree_fit, val_data) # predict the tree on the validation data
+    tree_perf <- poiss_dev(y = val_data$NCLAIMS, yhat = tree_pred*val_data$EXP) # evaluate the tree on the validation data
+    cp_perf[grep(val_fold,val_folds)] <- tree_perf
+  }
+  cv_perf[grep(cp,cp_grid)] <- mean(cp_perf)
+}
+```
+
+When predicting claim frequencies it is important (throughout the tutorial) that are `predict` functions for `rpart` and `gbm` can give predicted values at the response level, but they do not take exposure into account! That is why we use `yhat = tree_pred*val_data$EXP` when calculating the Poisson deviance in the instructions printed above.
+
+We can now investigate these results and observe that there is indeed an optimal `cp` value chosen, namely `r cp_grid[which.min(cv_perf)]`:
+
+```{r cv_vis}
+library(ggplot2)
+ggplot(data.table('cp' = as.factor(cp_grid), 'perf' = cv_perf), aes(cp, perf, group = 1)) + geom_line() + theme_bw() + theme(axis.text.x = element_text(angle = 90)) + ylab('Cross-validation performance')
+```
+
+# Interpretation tools
+
+This section covers some tools that can help to get insights from the fitted models.
+
+## Variable importance
+
+In this section we will investigate the variable importance in the fitted tree and gbm models. We start by loading the `ggplot2` package to create some nice graphs:
+
+```{r ggplot2}
+library(ggplot2)
+```
+
+The most important variables in the frequency regression tree are (by far) the bonus-malus level and the age of the policyholder:
+
+```{r vi tree freq}
+vi <- tree_freq$variable.importance
+vi[attr(tree_freq$terms, 'term.labels')[!(attr(tree_freq$terms, 'term.labels') %in% names(vi))]] = 0
+
+DTvi <- data.table(variable = names(vi), vi = vi)
+DTvi <- DTvi[, vi := round(vi/sum(vi), digits = 4)][order(-vi)]
+
+ggplot(DTvi, aes(reorder(variable,vi),vi)) + geom_col(colour = '#003366',fill = '#003366') + coord_flip() + theme_bw() + labs(x = '', y = 'variable importance') + ggtitle('Frequency tree')
+```
+
+The most important variables in the frequency gbm are the bonus-malus level, the age of the policyholders and the spatial information:
+
+```{r vi gbm freq}
+df_vi <- summary(gbm_freq, plotit = FALSE, normalize = FALSE)
+vi <- mapply(function(x,y) { y }, as.character(df_vi$var), df_vi$rel.inf, SIMPLIFY = TRUE, USE.NAMES = TRUE)
+
+DTvi <- data.table(variable = names(vi), vi = vi)
+DTvi <- DTvi[, vi := round(vi/sum(vi), digits = 4)][order(-vi)]
+
+ggplot(DTvi, aes(reorder(variable,vi),vi)) + geom_col(colour = '#003366',fill = '#003366') + coord_flip() + theme_bw() + labs(x = '', y = 'variable importance') + ggtitle('Frequency gbm')
+```
+
+## Partial dependence plots
+
+In this section we present some insights from the fitted tree and gbm models through partial dependence plots. 
+See <https://christophm.github.io/interpretable-ml-book/pdp.html> for an intro to these types of plots. Whereas the tutorial on gradient boosting with the CRAN package `gbm` was using the built-in partial dependence plots (at the level of the predictor) we now code the pdp ourselves, at the level of the response. 
+
+### Age of the policyholder
+
+We first look at the age effect in the frequency tree. Notice the step-wise behaviour, which is typical for a regression tree. We can observe that young policyholder pose a higher risk regarding claim frequency and the risk declines with increasing age.
+
+```{r pdp tree ageph}
+DTeffect <- data.table('AGEPH' = seq(min(data$AGEPH), max(data$AGEPH)))
+data_copy <- data.table::copy(data)
+effect <- sapply(1:nrow(DTeffect), 
+                 function(i) mean(predict(tree_freq, data_copy[,'AGEPH' := DTeffect[i, 'AGEPH', with=FALSE]])))
+DTeffect[, 'effect' := effect]
+
+ggplot(DTeffect, aes(x = AGEPH, y = effect)) + geom_line(colour = '#003366', size = 1) + theme_bw() + xlab('ageph') + ylab('Partial dependence') + ggtitle('Frequency tree')
+```
+
+Now we compare this with the age effect in the frequency gbm. Notice that the effect is much smoother compared to the regression tree effect. There is also an increase in risk for senior policyholders, which was not captured by the regression tree.
+
+```{r pdp gbm ageph, warning=FALSE}
+DTeffect <- data.table('AGEPH' = seq(min(data$AGEPH), max(data$AGEPH)))
+data_copy <- data.table::copy(data)
+effect <- sapply(1:nrow(DTeffect), 
+                 function(i) mean(predict(gbm_freq, data_copy[,'AGEPH' := DTeffect[i, 'AGEPH', with=FALSE]], type = 'response', n.trees = gbm_freq$n.trees)))
+DTeffect[, 'effect' := effect]
+
+ggplot(DTeffect, aes(x = AGEPH, y = effect)) + geom_line(colour = '#003366', size = 1) + theme_bw() + xlab('ageph') + ylab('Partial dependence') + ggtitle('Frequency gbm')
+```
+
+### Spatial effect
+
+We start by defining a function to read the shape file of Belgium, which we need to make plots on the Belgian map: 
+
+```{r shapefile, message=FALSE}
+library(rgdal)
+library(ggmap)
+setwd('C:/Users/u0043788/Dropbox/Data science for non-life insurance/Computer labs/Tree-based ML')
+readShapefile = function(){
+  belgium_shape <- readOGR(dsn = path.expand(paste(getwd(),"/Shape file Belgie postcodes",sep="")), layer = "npc96_region_Project1")
+  belgium_shape <- spTransform(belgium_shape, CRS('+proj=longlat +datum=WGS84'))
+  belgium_shape$id <- row.names(belgium_shape)
+  return(belgium_shape)
+}
+```
+
+We first look at the spatial effect in the frequency tree. Notice the squared behaviour on the map of Belgium. This is the 2D equivalent of the previously observed step-wise effect. Brussels clearly pops out as the most risky area to reside and drive a car.
+
+```{r pdp tree spatial, message=FALSE, warning=FALSE}
+DTeffect <- data.table('LONG' = unname(coordinates(readShapefile())[,1]),
+                       'LAT' = unname(coordinates(readShapefile())[,2]))
+data_copy <- data.table::copy(data)
+effect <- sapply(1:nrow(DTeffect), 
+                 function(i) mean(predict(tree_freq, data_copy[, c('LONG','LAT') := DTeffect[i, c('LONG','LAT'), with=FALSE]])))
+DTeffect[, 'effect' := effect]
+
+belgium_shape <- readShapefile()
+belgium_shape@data <- cbind(belgium_shape@data, DTeffect[,'effect'])
+belgium_shape_f <- fortify(belgium_shape)
+belgium_shape_f <- merge(belgium_shape_f, belgium_shape@data, all.x = TRUE)
+ggplot(belgium_shape_f, aes(long, lat, group = group)) + geom_polygon(aes(fill = belgium_shape_f$effect)) + scale_fill_gradient(low='#99CCFF',high='#003366') + theme_nothing(legend = TRUE) + labs(fill='Part. dep.') + ggtitle('Frequency tree')
+```
+
+Now we compare this with the spatial effect in the frequency gbm. We can see that the same trend is followed as in the regression tree, but again in a much smoother way. Brussels still pops out as the most risky area to reside regarding claim frequency.
+
+```{r pdp gbm spatial, message=FALSE, warning=FALSE}
+DTeffect <- data.table('LONG' = unname(coordinates(readShapefile())[,1]),
+                       'LAT' = unname(coordinates(readShapefile())[,2]))
+data_copy <- data.table::copy(data)
+effect <- sapply(1:nrow(DTeffect), 
+                 function(i) mean(predict(gbm_freq, data_copy[, c('LONG','LAT') := DTeffect[i, c('LONG','LAT'), with=FALSE]], type = 'response', n.trees = gbm_freq$n.trees)))
+DTeffect[, 'effect' := effect]
+
+belgium_shape <- readShapefile()
+belgium_shape@data <- cbind(belgium_shape@data, DTeffect[,'effect'])
+belgium_shape_f <- fortify(belgium_shape)
+belgium_shape_f <- merge(belgium_shape_f, belgium_shape@data, all.x = TRUE)
+ggplot(belgium_shape_f, aes(long, lat, group = group)) + geom_polygon(aes(fill = belgium_shape_f$effect)) + scale_fill_gradient(low='#99CCFF',high='#003366') + theme_nothing(legend = TRUE) + labs(fill='Part. dep.') + ggtitle('Frequency gbm')
+```
+
+
+## Individual conditional expectations
+
+In this section we will try to get some more insights from the fitted tree and gbm models through individual conditional expectations. 
+See <https://christophm.github.io/interpretable-ml-book/ice.html> for an intro to these types of plots.
+
+### Age of the policyholder
+
+We first look at the age effect in the frequency tree. The blue line is the same one as we saw previously in the PDP section. The grey lines show the effect of the age on individual policyholder level. The blue line can be interpreted as the average effect of all these grey lines. We can again see a clear trend in decreasing riskiness with increasing age, although there are some risk profiles where the riskiness increases with increasing age.
+
+```{r ice tree ageph}
+DTeffect <- data.table('AGEPH' = seq(min(data$AGEPH), max(data$AGEPH)))
+data_copy <- data.table::copy(data)
+effect <- sapply(1:nrow(DTeffect), 
+                 function(i) predict(tree_freq, data_copy[,'AGEPH' := DTeffect[i, 'AGEPH', with=FALSE]]))
+DTeffect <- cbind(DTeffect, t(effect))
+
+set.seed(54321)
+# Select 10 000 random profiles for the ice curves
+ice_profiles <- c(1,sample(2:ncol(DTeffect),10000))
+ggplt <- ggplot()
+# Add the ice curves
+ggplt <- ggplt + geom_line(data = melt(DTeffect[, ice_profiles, with = FALSE], id.vars = 'AGEPH'), aes(x = AGEPH, y = value, group = variable), alpha = 0.1, colour = 'grey75')
+# Add the pdp curve
+ggplt <- ggplt + geom_line(data = data.table('AGEPH' = DTeffect[['AGEPH']], 'effect' = rowMeans(DTeffect[, 2:ncol(DTeffect)])), aes(x = AGEPH, y = effect, group = 1), colour = 'navy', size = 1)
+# Add some style
+ggplt <- ggplt + theme_bw() + xlab('ageph') + ylab('Individual conditional expectation') + ggtitle('Frequency tree')
+ggplt
+```
+
+Now we compare this with the age effect in the frequency gbm. The effect is again much smoother compared to the regression tree and also on individual policyholder level there seems to be a monotonous decrease in riskiness with an increase for senior policyholders.
+
+```{r ice gbm ageph, message=FALSE, warning=FALSE}
+DTeffect <- data.table('AGEPH' = seq(min(data$AGEPH), max(data$AGEPH)))
+data_copy <- data.table::copy(data)
+effect <- sapply(1:nrow(DTeffect), 
+                 function(i) predict(gbm_freq, data_copy[,'AGEPH' := DTeffect[i, 'AGEPH', with=FALSE]]))
+DTeffect <- cbind(DTeffect, t(effect))
+
+set.seed(54321)
+# Select 10 000 random profiles for the ice curves
+ice_profiles <- c(1,sample(2:ncol(DTeffect), 10000))
+ggplt <- ggplot()
+# Add the ice curves
+ggplt <- ggplt + geom_line(data = melt(DTeffect[, ice_profiles, with = FALSE], id.vars = 'AGEPH'), aes(x = AGEPH, y = value, group = variable), alpha = 0.1, colour = 'grey75')
+# Add the pdp curve
+ggplt <- ggplt + geom_line(data = data.table('AGEPH' = DTeffect[['AGEPH']], 'effect' = rowMeans(DTeffect[, 2:ncol(DTeffect)])), aes(x = AGEPH, y = effect, group = 1), colour = 'navy', size = 1)
+# Add some style
+ggplt <- ggplt + theme_bw() + xlab('AGEPH') + ylab('Individual conditional expectation') + ggtitle('Frequency tree')
+ggplt
+```
+
+
+# Economic value
+
+To wrap up this tutorial we add some final words on the economic value of different models, also called the model lift. This does not necessarily refer to actual profits, but more towards the possibility for an insurance company to avoid adverse selection. For some information on model lift, see Chapter 7 of this document: <https://www.casact.org/pubs/monographs/papers/05-Goldburd-Khare-Tevet.pdf>.
+
+An economic analysis of the tariffs obtained from different models starts by loading data on premium predictions calculated via regression trees, random forests, gradient boosting machines, generalized additive models and generalized linear models. These premium predictions are obtained in our paper [https://arxiv.org/abs/1904.10890](Boosting insights in insurance tariff plans with tree-based machine learning) by Roel Henckaerts, Katrien Antonio, Marie-Pier Côté (Université de Laval, Canada) and Roel Verbelen. in a very similar manner as explained in this tutorial.
+
+You should now carefully read Section 5 in the paper on Model lift: from analytic to managerial insights. This Section discusses useful tools for an economic comparison of different tariffs.
+
+```{r, eval=FALSE}
+# this code can be used to extract the R code from an R Markdown (Rmd) document
+library(knitr)
+setwd('C:/Users/u0043788/Dropbox/Data science for non-life insurance/Computer labs/Tree-based ML')
+file.exists("2019-05-01 Tree-based ML.Rmd")
+purl("2019-05-01 Tree-based ML.Rmd")
+```

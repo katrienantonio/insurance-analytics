@@ -1,0 +1,359 @@
+---
+title: "Gradient boosting machines for modelling insurance data"
+author: "Katrien Antonio, Roel Henckaerts"
+date: "April 2019"
+output:
+  html_document:
+    theme: spacelab
+    toc: yes
+    toc_depth: 3
+    toc_float:
+      collapsed: yes
+      smooth_scroll: yes
+  pdf_document: default
+  word_document: default
+graphics: yes
+---
+
+
+```{r, include=FALSE}
+# overall knitr options
+knitr::opts_chunk$set(cache = FALSE, echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# Goal of the demo
+
+This demo illustrates the basic principles of fitting claim frequency data with a gradient boosting machine as implemented in the `gbm` package. The code is based on lecture sheets developed by prof. Julien Trufin on 'Machine learning techniques in non-life insurance ratemaking' and on the lecture notes by prof. Mario Wüthrich on 'Data analytics for non-life insurance pricing'. A detailed use case on modelling claim frequency as well as severity data with gbms is documented in the paper [https://arxiv.org/abs/1904.10890](Boosting insights in insurance tariff plans with tree-based machine learning) by Roel Henckaerts, Katrien Antonio, Marie-Pier Côté (Université de Laval, Canada) and Roel Verbelen.
+
+In this demo you focus on fitting gradient boosting machines with the R package `gbm`. This package is an implementation of extensions to Freund and Schapire's AdaBoost algorithm and Friedman's gradient boosting machine. It includes regression methods for least squares, absolute loss, t-distribution loss, quantile regression, logistic, multinomial logistic, Poisson, Cox proportional hazards partial likelihood, AdaBoost exponential loss, Huberized hinge loss, and Learning to Rank measures (LambdaMart). The package was originally developed by Greg Ridgeway. 
+
+With a focus on insurance pricing the Poisson deviance loss function is relevant for modeling frequency data (available in `gbm`). For modelling severities we typically use the gamma deviance as loss function. The latter is not available in the `gbm` package on CRAN, but it is available in the `gbm` package maintained on the GitHub page of Harry Southworth.
+
+Make sure to install and to load the package before actually using it. We start with the `gbm` package available on CRAN.
+
+```{r gbm_package}
+# remove.packages('gbm')
+# install.packages("gbm")
+library(gbm)
+```
+
+# Basic concepts illustrated on simulated data
+
+## Generating the data
+
+You simulate a data set of claim frequencies to illustrate the basic instructions. To replicate the results of the demo, you first specify a `seed`.
+
+```{r set_seed}
+set.seed(1)
+```
+In `R` the instruction `set.seed()` is the recommended way to specify seeds. This sets the seed of `R`'s random number generator, which is useful for creating simulations or random objects that can be reproduced.
+
+You generate a data set of size `n`, in this case: 1000 records are generated. 
+
+```{r set_n}
+n <- 1000 # number of observations
+```
+
+Covariates in the artificial data set are: `Gender`, `Age`, `Split` and `Sport`. You generate their values as follows: 
+
+```{r generate_covariates}
+Gender <- factor(sample(c("m", "f"), n, replace=TRUE))
+Age <- sample(c(18:65), n, replace=TRUE)
+Split <- factor(sample(c("yes", "no"), n, replace = TRUE))
+Sport <- factor(sample(c("yes", "no"), n, replace = TRUE))
+```
+
+You will work with the following Poisson regression model
+\begin{eqnarray*}
+N_i &\sim& \text{POI}(\lambda_i)  \\
+\lambda_i &=& \exp{(\boldsymbol{x}_i^{'} \cdot \boldsymbol{\beta})}
+\end{eqnarray*}
+and let the mean of the Poisson distribution depend on the covariates in the following way.
+
+```{r specify_lambda}
+lambda <- 0.1*ifelse(Gender == "m", 1.5, 1)
+lambda <- lambda*ifelse(Age >= 18 & Age < 30, 3, 1)
+lambda <- lambda*ifelse(Age >= 30 & Age < 45, 2, 1)
+lambda <- lambda*ifelse(Sport == "yes", 2.5, 1)
+```
+
+Thus, the expected claim frequency depends on `Age`, `Gender` and `Sport`, but not on `Split`. As a final step in generating the data, you randomly pick observations from a Poisson distribution with the specified vector `lambda` as the mean. You store the resulting, artificial data set in the object `data`.
+
+```{r generate_poisson_data}
+N <- rpois(n, lambda)
+data <- data.frame(N, Gender, Age, Sport, Split)
+```
+
+You can inspect the first rows of this dataframe with the `head` function.
+
+```{r inspect_data}
+head(data, n = 10)
+```
+
+
+## Algorithmic essentials when fitting a gbm
+
+The simulated data can be used to fit a gbm, where the goal is to explain the number of claims `N` using the predictors `Age`, `Gender`, `Sport` and `Split`. Boosting is an iterative statistical
+method that combines many weak learners into one powerful predictor. Friedman (2001) introduced decision trees as weak learners; each tree improves the current model fit, thereby using information from previously grown trees. At each iteration, the pseudo-residuals are used to assess the regions of the predictor space for which the model performs poorly. The fit is then improved in a direction of better overall performance. The pseudo-residual $\rho_{i,t}$ for observation $i$ in iteration $t$ is calculated as the negative gradient of the loss function $-\partial \mathscr{L}\{y_i,f(\boldsymbol{x}_i)\} / \partial f(\boldsymbol{x}_i)$, evaluated at the current model fit. Hence, the name gradient boosting machine (`gbm`). The boosting method learns slowly by fitting a small tree of depth $d$ to these pseudo-residuals, improving the model fit in areas where it does not perform well. For each region $R_j$ of that tree, the update $\hat{b}_j$ is calculated as the constant that has to be added to the previous model fit to minimize the loss function, namely $b$ that minimizes $\mathscr{L}\{y_i,f(\boldsymbol{x}_i)+b\}$ over this region. A shrinkage parameter $\lambda$ controls the learning speed by shrinking updates as follows: $f_{new}(\boldsymbol{x}) = f_{old}(\boldsymbol{x}) + \lambda \cdot update$. A lower $\lambda$ usually results in better performance but also increases computation time because more trees are needed to converge to a good solution. The collection of trees at the final iteration $T$ is used to make predictions. Algorithm 2 in [https://arxiv.org/abs/1904.10890](Boosting insights in insurance tariff plans with tree-based machine learning) is a sketch of the essential steps in the fitting procedure.
+
+The `gbm` function allows a lot of tuning parameters in its specification. A detailed explanation can be found here: <https://www.rdocumentation.org/packages/gbm/versions/2.1.4/topics/gbm>. The most important tuning parameters are the following ones:
+
+* `n.trees`: the number of trees used in the ensemble, denoted with $T$ in the Henckaerts et al. (2019) paper
+* `interaction.depth`: the depth of each of the trees used in the ensemble, denoted $d$ in the Henckaerts et al. (2019) paper.
+
+These tuning parameters are discussed in detail in [https://arxiv.org/abs/1904.10890](Boosting insights in insurance tariff plans with tree-based machine learning) by Roel Henckaerts, Katrien Antonio, Marie-Pier Côté (Université de Laval, Canada) and Roel Verbelen.
+
+Next to these tuning parameters you will also have to fix some hyperparameters, e.g.:
+
+* `shrinkage`: the shrinkage or learning rate which controls the learning speed by shrinking updates, $\lambda$ in the Henckaerts et al. (2019) paper
+* `bag.fraction`: the subsampling fraction leading to stochastic gradient boosting, introduced by Friedman (2002). This injects randomness in the training process by subsampling the data at random without replacement in each iteration. In each iteration, the model update is computed from a randomly selected subsample of size `bag.fraction` times the number of observations in the training data set. This `bag.fraction` is denoted as $\delta$ in Henckaerts et al. (2019).
+
+Naturally, you will also have to make a meaningful choice for the distribution of the respons variable:
+* `distribution`: the distribution assumed for the response variable.
+
+The basic function call in `gbm` then goes as follows:
+
+```{r gbm_fit_sim}
+set.seed(3)
+gbm_sim <- gbm(N ~ Gender + Age + Split + Sport, # formula
+               data = data, # data set
+               var.monotone = c(0,0,0,0), # -1: monotone decrease, +1: monotone   increase, 0: no monotone restrictions
+               distribution = "poisson", # see the help for other choices
+               n.trees = 250, # number of trees
+               shrinkage = 0.05, # shrinkage or learning rate
+               interaction.depth = 3, # 1: additive model, 2: two-way interactions, etc.
+               bag.fraction = 0.5, # subsampling fraction
+               train.fraction = 1, # fraction of data for training
+               n.minobsinnode = 10, # minimum total weight needed in each node
+               cv.folds = 3, # do 3-fold cross-validation
+               keep.data = TRUE, # keep a copy of the dataset with the object
+               verbose = FALSE, # don’t print out progress
+               n.cores = 1) # use only a single core
+```
+
+
+## A first exploration
+
+A `print` of the fitted gbm object gives you an overview of the fitted model and its main characteristics (e.g. loss function used, number of iterations, best iteration)
+
+```{r print_gbm}
+print(gbm_sim)
+```
+
+A `summary` call on the fitted gbm object `gbm_sim` returns the importance of each of the covariates used in the model. For a covariate $x_{\ell}$ in the set of available covariates $\{1,\ldots, p\}$ the importance of a specific feature $x_{\ell}$ in a tree $t$ is measured by summing the improvements in the loss function over all splits on $x_{\ell}$
+
+\begin{eqnarray*}
+\mathcal{I}_{\ell}(t) &=& \sum_{j=1}^{J-1} \mathbb{I}\{v(j)= \ell\}(\Delta \mathcal{L})_j.
+\end{eqnarray*}
+
+We often normalize these variable importance values such that they sum to 100\%, giving a clear idea about the relative contribution of each variable.
+
+For an ensemble of trees we average the importance of variable $x_{\ell}$ over the different trees that compose the ensemble
+
+\begin{eqnarray*}
+\mathcal{I}_{\ell} &=& \frac{1}{T}\sum_{t=1}^{T} \mathcal{I}_{\ell}(t).
+\end{eqnarray*}
+
+```{r var_imp}
+summary(gbm_sim)
+```
+
+Note that these `rel.inf` sum to 100:
+
+```{r var_imp_sum_100}
+sum(summary(gbm_sim)$rel.inf)
+```
+
+The variable `Age` is most informative when modelling the number of claims, followed by `Sport` and `Gender`. The explanatory power of `Split` is weak, as expected.
+
+The `gbm` uses a log link and the exposure is treated properly (shown later on). The argument `initF` is the initial predicted value to which trees make adjustments (on the log scale), and here it is
+
+```{r initF}
+gbm_sim$initF
+exp(gbm_sim$initF)
+sum(data$N)/n
+```
+
+The deviance computed here is twice the negative loglikelihood (up to a constant) \[-2\times\frac{1}{n}\sum_{i=1}^n y_i \{f(x_i)+\log(d_i)\}-\exp\{f(x_i)+\log(d_i)\},\] which is proportional to the deviance but does not include the saturated model loglikelihood. As this is just a constant, results are equivalent. The training deviance can be plotted against the number of boosted trees as follows. As expected, training deviance decreases when increasing the number of trees, and overfitting results. 
+
+```{r}
+gbm_sim$train.error[250]
+-2*mean(data$N*(gbm_sim$fit+log(1))-exp(gbm_sim$fit+log(1)))
+plot(gbm_sim$train.error, type = "l", xlab = "Number of boosted trees")
+```
+
+
+It is also possible to inspect the trees constructed in the `gbm` fitting process. You can extract these with the function `pretty.gbm.tree`. In what follows, `SplitVar = -1` indicates a terminal node, the other variables are numbered from 0 to 3 according to the order `Gender + Age + Split + Sport` used in the `gbm` function call. `LeftNode` gives the index of the row (in the printed output) corresponding to the left node, similar for `RightNode`. Below, the first tree constructed by the `gbm` first splits on `Sport`, followed by a split on `Age` (at split point 44.5) and a split on `Gender`. Recall that we specified the `interaction.depth` equal to 3 in the `gbm` call. The second tree in the ensemble splits on `Sport` and `Age`, the final tree in the ensemble only splits on `Age`.
+
+```{r inspect_trees_gbm}
+pretty.gbm.tree(gbm_sim, i.tree = 1)
+pretty.gbm.tree(gbm_sim, i.tree = 2)
+pretty.gbm.tree(gbm_sim, i.tree = 250)
+```
+
+## Optimal number of trees
+
+It is very unlikely that our random guess of `n.trees` equals 250 is indeed the optimal value for the number of boosting iterations in the gbm. There are multiple ways of tuning the number of trees when using the `gbm` package.
+
+A first approach uses the **out-of-bag (OOB)** error estimate. The out-of-bag (OOB) error is a way to measure the prediction error of machine learning models utilizing bootstrap aggregating (bagging) to sub-sample data samples used for training. We can predict each observation $i$ using each of the trees in which that observation was out-of-bag. In order to obtain a single prediction for the $i$th observation, we can average these predicted responses (if regression is the goal). An OOB prediction
+can be obtained in this way for each of the $n$ observations, from which the
+overall OOB MSE (for a regression problem) can be computed. The resulting OOB error is a valid estimate of the test error for the bagged model, since the response for each observation is predicted using only the trees that were not fit using that observation.
+
+```{r opt_boost_it1}
+best.iter.oob <- gbm.perf(gbm_sim, method = "OOB")
+print(best.iter.oob)
+```
+
+The graph shows the train error in black and the test error in red, with the optimal number of boosting iterations equal to `r best.iter.oob`. Naturally, the train error decreases when increasing the number of trees `n.trees`. The test error first decreases, followed by an increase of the test error when `n.trees` grows. 
+
+A second approach uses the **heldout test set**. To use this option you should put the `train.fraction` to a value less than 1. For example
+
+```{r gbm_fit_train_fraction}
+gbm_sim <- gbm(N ~ Gender + Age + Split + Sport, # formula
+               data = data, # data set
+               var.monotone = c(0,0,0,0), # -1: monotone decrease, +1: monotone   increase, 0: no monotone restrictions
+               distribution = "poisson", # see the help for other choices
+               n.trees = 250, # number of trees
+               shrinkage = 0.05, # shrinkage or learning rate
+               interaction.depth = 3, # 1: additive model, 2: two-way interactions, etc.
+               bag.fraction = 0.5, # subsampling fraction
+               train.fraction = 0.5, # fraction of data for training
+               n.minobsinnode = 10, # minimum total weight needed in each node
+               cv.folds = 3, # do 3-fold cross-validation
+               keep.data = TRUE, # keep a copy of the dataset with the object
+               verbose = FALSE, # don’t print out progress
+               n.cores = 1) # use only a single core
+```
+
+The train error is shown in black and the test error in red.
+
+```{r opt_boost_it2}
+best.iter.test <- gbm.perf(gbm_sim, method = "test")
+print(best.iter.test)
+```
+
+The graph shows the train error in black and the test error in red, with the optimal number of boosting iterations equal to `best.iter.test`. 
+
+A third approach performs **cross-validation** to find the optimal number of boosting iterations.
+
+```{r opt_boost_it3}
+best.iter.cv <- gbm.perf(gbm_sim, method = "cv")
+print(best.iter.cv)
+```
+
+The graph shows the train error in black, the validation error in green and the test error in red, with the optimal number of boosting iterations equal to `best.iter.cv`. 
+
+We can now revisit the variable importance, using the optimal number of trees according to the cross-validation approach. The importance of the variable `Split` has reduced to almost zero and also the other importance values seem to be more in line with the simulated relationships. This indicates that the new fit captures the data dynamics in a better way.
+
+```{r var_imp_opt}
+summary(gbm_sim, n.trees = best.iter.cv)
+```
+
+## Partial dependence plots
+
+In addition to the importance of each variable it is relevant to understand the effect that each variable has on the claim frequency. In order to do so we can create **partial dependence plots** showing the marginal effect of each variable on the claim frequency. Hereto, we evaluate the prediction function in specific values of the variable of interest $x_{\ell}$, while averaging over a range of values of the other variables $\boldsymbol{x}^{\star}$:
+\[\bar{f}_{\ell}(x_{\ell}) = \frac{1}{n}\sum_{i=1}^n f_{\text{model}}(x_{\ell}, \boldsymbol{x}_i^{\star}).\]
+
+```{r pdp_sim}
+par(mfrow = c(2,2))
+plot(gbm_sim, 1, best.iter.cv, ylim=c(-1.5,-0.5))
+plot(gbm_sim, 2, best.iter.cv, ylim=c(-1.5,-0.5))
+plot(gbm_sim, 3, best.iter.cv, ylim=c(-1.5,-0.5))
+plot(gbm_sim, 4, best.iter.cv, ylim=c(-1.5,-0.5))
+```
+
+These plots clearly indicate that driving a sports car, being younger and being male increases the likelihood of a claim. Note thate the plots created by the `gbm` package are at the level of the predictor, and not at the level of the response. 
+
+We can also have a look at these partial dependence plots, when splitting over the different variables. In the example below we consider `AGE`, `GENDER` and `SPORT`. The evolution of riskiness across the age of the policyholder is similar for the four profiles under consideration, but the level of the curve differs in every case.
+
+```{r}
+par(mfrow = c(1,1))
+plot(gbm_sim, c(1,2,4), best.iter.cv)
+```
+
+The package `pdp` allows to draw more fancy partial dependence plots. For example, 
+
+```{r}
+#install.packages("pdp")
+library(pdp)
+pd <- partial(gbm_sim, n.trees = best.iter.cv, pred.var = c("Age"))
+age_pdp <- plotPartial(pd)
+```
+
+## Individual conditional expectation plots
+
+Individual conditional expectation plots (ICE plots) are also possible within the ``pdp` package. These show the effect of a variable on the predictions obtained from a model, but at the level of an individual observation $i$. We evaluate the prediction function in specific values of the variable of interest $x_{\ell}$, while the values of the other variables $\boldsymbol{x}^{\star}$ are kept fixed
+\[\tilde{f}_{\ell,i}(x_{\ell}) = f_{\text{model}}(x_{\ell},\ \boldsymbol{x}_i^{\star}) \]
+where $\boldsymbol{x}_i^{\star}$ are the realized values of the other variables for observation $i$. We obtain an effect for each observation $i$, allowing us to detect interaction effects when some observations show
+different behavior compared to others. Individual conditional expectations can also be used to investigate the uncertainty of the effect of variable $x_{\ell}$ on the prediction outcome.
+
+```{r}
+set.seed(8711)
+age_ice <- partial(gbm_sim, n.trees = best.iter.cv, pred.var = "Age", ice = TRUE)
+plotPartial(age_ice[age_ice$yhat.id%in%sample(unique(age_ice$yhat.id), 100),], plot.pdp = FALSE, alpha = 0.2)
+sport_ice <- partial(gbm_sim, n.trees = best.iter.cv, pred.var = "Sport", ice = TRUE)
+plotPartial(sport_ice[sport_ice$yhat.id%in%sample(unique(sport_ice$yhat.id), 100),], plot.pdp = FALSE, alpha = 0.2)
+```
+
+
+## Predictions from a fitted model
+
+Once you are happy with your final model, you will use it to create predictions.
+
+```{r pred}
+lambda_hat <- predict(gbm_sim, data, n.trees = best.iter.cv, type = 'response')
+data$lambda_hat <- lambda_hat
+head(data, n = 10)
+```
+
+# Fitting the MTPL data set
+
+Now it is your turn to grow a `gbm` ensemble for the MTPL data set that was used earlier in the course. 
+
+Start by loading the data.
+
+```{r mtpl_data}
+path <- file.path('C:/Users/u0043788/Dropbox/IIR Machine learning en Data Science opleiding/R demos/Gradient boosting')
+path.MTPL <- file.path(path, "P&Cdata.txt")
+data <- read.table(path.MTPL, header = TRUE)
+data <- as.data.frame(data)
+head(data)
+```
+
+As a first step you fit a `gbm` for claim frequency using a selection of the available covariates. The `gbm` package available on CRAN has some difficulties with columns in the data set that are not used in the analysis. Therefore we first select the relevant columns
+```{r subset_mtpl}
+str(data)
+data_subset <- data[ , c(2, 5:14)]
+```
+
+We fit a Poisson `gbm` using the subset of the data.
+
+```{r gbm_mtpl}
+set.seed(3)
+gbm_mtpl <- gbm(NCLAIMS ~ COVERAGE + FUEL + USE + FLEET + SEX + AGEPH + BM + AGEC + POWER + offset(log(EXP)), # formula
+               data =  data_subset, # data set
+               var.monotone = rep(0,9), # -1: monotone decrease, +1: monotone increase, 0: no monotone restrictions
+               distribution = "poisson", # see the help for other choices
+               n.trees = 500, # number of trees
+               shrinkage = 0.01, # shrinkage or learning rate
+               interaction.depth = 2, # 1: additive model, 2: two-way interactions, etc.
+               bag.fraction = 0.5, # subsampling fraction
+               train.fraction = 0.5, # fraction of data for training
+               n.minobsinnode = 10000, # minimum total weight needed in each node
+               cv.folds = 3, # do 3-fold cross-validation
+               keep.data = TRUE, # keep a copy of the dataset with the object
+               verbose = FALSE, # don’t print out progress
+               n.cores = 1) # use only a single core
+```
+
+You can now repeat the steps demonstrated earlier on in the tutorial to find the optimal number of trees in the ensemble, the partial dependence plots and so on. 
+
+The gamma deviance loss function is available in the version of the `gbm` package maintained on the GitHub op Harry Southworth. After removing the CRAN `gbm` package, you can install Southworth's `gbm` as follows. This will be demonstrated in the next tutorial. 
+
+```{r, eval=FALSE}
+# this code can be used to extract the R code from an R Markdown (Rmd) document
+library(knitr)
+setwd('C:/Users/u0043788/Dropbox/Data science for non-life insurance/Computer labs/Gradient boosting')
+file.exists("2019-04-26 Gradient boosting with gbm.Rmd")
+purl("2019-04-26 Gradient boosting with gbm.Rmd")
+```

@@ -1,0 +1,162 @@
+---
+title: "Building sparse GLMs with the `glmnet` package"
+author: "Katrien Antonio and Sander Devriendt"
+date: "13 May 2019"
+output:
+  html_document:
+    theme: spacelab
+    toc: yes
+    toc_depth: 2
+    toc_float:
+      collapsed: yes
+      smooth_scroll: yes
+  bookdown::html_document2: default
+  pdf_document: default
+  word_document: default
+graphics: yes
+---
+
+```{r, include=FALSE}
+# overall knitr options
+knitr::opts_chunk$set(cache = FALSE, echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# Introduction
+
+You now focus on predicting the expected claim frequency for a Motor Third Party Liability (MTPL) portfolio. You can load this data set into `R` using the following code.
+
+```{r load_data_set}
+path <- "C:/Users/u0043788/Dropbox/APC Module Data Science/R demos/Lasso"
+MTPL.path <- file.path(path, "P&Cdata_extended.txt")
+MTPL <- read.table(MTPL.path)
+head(MTPL)
+```
+
+This data set now lists info on 16 different variables for 163 234 policyholders. Your goal is to find which variables are relevant to explain the observed claim frequency such that you can build a sparse, interpretable, Generalized Linear Model (GLM).
+
+# A first look: Poisson GLM 
+
+You will first look at the names of all the variables in the data set.
+
+```{r data_inspection}
+names(MTPL)
+```
+
+`NCLAIMS` gives the number of claims filed by the policyholder during the length of the insured period (in years) represented by the exposure variable `DURATION`. The policyholder information is given by `AGEPH`, `SEX`, `BM`, `POPUL`, `PERIOD` and `COVERAGE`, representing the age, gender and bonus-malus scale, the population of the policyholder's municipality, the payment frequency and the coverage type. The vehicle characteristics are given by `AGEC` (age of the car in years), `FUEL` (fuel type), `SPORT` (sportive vehicle or not), `FLEET` (part of a fleet or not), `MONOVOL` (monovolume or not), `POWER` (power of the car in kWh), `FOUR` (four-wheel drive) and `USE` (professional or private use). For this analysis, you will not use the spatial and model/make information provided in `CODPOSS`, `TOWN`, `ZIP`, `MARQCOD`, `MAKE` and `MODCOD`. Variables `AMOUNT` and `Y` can be used to do a severity analysis on the claim amounts or a logistic analysis on the binary response of policyholders filing at least one claim or not, or filing a large claim or not.
+
+<!-- The variable `ID` just numbers the rows of our data set and will thus be left out of our analysis. `NCLAIMS` gives the number of claims filed by the policyholder during the length of the insured period (in days) represented by the exposure variable `DURATION`. The policyholder information is given by `AGEPH`, `SEX`, `BM`, `POPUL`, `PERIOD` and `COVERAGE`, representing the age, gender and bonus-malus scale, the population of the policyholder's municipality, the payment frequency and the coverage type. The vehicle characteristics are given by `AGEC` (age of the car in years), `FUEL` (fuel type), `SPORT` (sportive vehicle or not), `FLEET` (part of a fleet or not), `MONOVOL` (monovolume), `POWER` (power of the car in kWh), `FOR` (four-wheel drive) and `USE` (professional or private use). For this analysis, will not use the spatial and model/make information provided in `CODPOSS`, `TOWN`, `ZIP`, `MARQCOD`, `MAKE` and `MODCOD`. Variables `AMOUNT` and `Y` can be used to do a severity analysis on the claim amounts or a logistic analysis on the binary response of policyholders filing at least one claim or not. -->
+
+<!-- Before we try out a first GLM, we need to do some data cleaning to get meaningfull results. The categorical variables need to be treated as factors and we remove some levels from some factors as they contain very few observations. -->
+
+<!-- ```{r data_cleaning, include = TRUE} -->
+<!-- MTPL <- subset(MTPL, DURATION != 0)                ## remove observations with no exposure  -->
+<!-- MTPL <- subset(MTPL, SEX != 3 & FUEL %in% c(1,2))  ## remove few observations which refer to companies (sex == 3) or have a rare fuel type (lpg, electric, other) -->
+
+<!-- MTPL$DURATION   <- MTPL$DURATION/365               ## % of the year insured. Serves as exposure variable -->
+<!-- MTPL$SEX        <- as.factor(MTPL$SEX)  -->
+<!-- MTPL$PERIOD     <- as.factor(MTPL$PERIOD)          ## payment frequency (yearly vs biyearly vs triyearly vs monthly) -->
+<!-- MTPL$USE        <- as.factor(MTPL$USE)             ## private or professional use -->
+<!-- MTPL$COVERAGE   <- as.factor(MTPL$COVERAGE)        ## type of coverage (standard, small omnium, omnium) -->
+<!-- MTPL$FUEL       <- as.factor(MTPL$FUEL)            ## type of fuel -->
+<!-- MTPL$SPORT      <- as.factor(MTPL$SPORT)           ## sportive vehicle or not -->
+<!-- MTPL$FLEET      <- as.factor(MTPL$FLEET)           ## vehicle part of a fleet or not -->
+<!-- MTPL$MONOVOL    <- as.factor(MTPL$MONOVOL)         ## monovolume or not -->
+<!-- MTPL$FOR        <- as.factor(MTPL$FOR)             ## four by four vehicle or not -->
+<!-- ``` -->
+
+With these variables, you build a Poisson GLM with `NCLAIMS` as response, `DURATION` as offset and the rest of the variables as predictors. For simplicity, you assume that the numeric variables will have a linear effect on the response. This way, they can be represented by one coefficient in the GLM framework. The other variables will each have $k-1$ coefficients with $k$ the number of levels within the variable. The first level will be used as reference category.
+From the output below, some coefficients do not seem to be significantly different from 0 and thus could be removed from the model. However, removing a variable or coefficient will have an immediate effect on the estimation of the others so a careful analysis needs to be made.
+
+```{r GLM}
+MTPL_formula <- NCLAIMS ~ 1 + AGEPH + SEX + BM + POPUL + PAYFREQ + COVERAGE + AGEC + FUEL + SPORT + FLEET + MONOVOL + POWER + FOUR + USE
+MTPL_GLM <- glm(MTPL_formula, data = MTPL, offset = log(MTPL$DURATION), family=poisson())
+summary(MTPL_GLM)
+```
+
+Traditionally, one can use best subset selection to find the right features and coefficients for the predictive problem. However, for big data sets, this is often not feasible due to the number of possible feature combinations growing exponentially. You will now examine a more manageable alternative by using regularization.
+
+# A regularized Poisson GLM
+
+You will use the `glmnet` package in this demo. You can install the package using the following code.
+```{r install_package_glmnet, eval = FALSE, include = TRUE}
+install.packages(glmnet)
+```
+You load the `glmnet` package and look at the manual for the main function.
+```{r glmnet0, eval = TRUE, include = FALSE}
+library(glmnet)
+```
+
+```{r glmnet, eval = FALSE, include = TRUE}
+library(glmnet)
+? glmnet
+```
+
+The arguments for `glmnet` are different than for the standard `glm` function. You need to give the model matrix (without intercept) `x` and response `y` separately, choose the penalty through the `alpha` argument and set the number of $\lambda$'s calculated with `nlambda`. The 'details' section explains that `alpha` = 1 refers to the Lasso penalty, `alpha`=0 to the ridge penalty and anything in between to the elastic net. You choose the Lasso penalty, but feel free to check the results with other settings to get a grip on how the different penalties work.
+
+```{r glmnet_fit}
+y <- MTPL$NCLAIMS
+# set up model matrix, note that factors with more than two levels are coded without a reference category (see the contrasts.arg argument)
+x <- model.matrix( ~ 1 + AGEPH + SEX + BM + POPUL + PAYFREQ + COVERAGE + AGEC + FUEL + SPORT + FLEET + MONOVOL + POWER + FOUR + USE, data = MTPL, contrasts.arg = lapply(MTPL[,c("PAYFREQ", "COVERAGE")], contrasts, contrasts=FALSE))[,-1]
+# check first 10 rows in x
+x[1:10,]
+# ensure a Lasso penalty
+alpha <- 1    
+# fit regularized Poisson model with Lasso penalty 
+MTPL_glmnet <- glmnet(x = x, y = y, family = "poisson", offset = log(MTPL$DURATION), alpha = alpha, standardize = TRUE, intercept = TRUE)
+# show the coefficient names in order of the fitted model
+(coefficient_names <- row.names(MTPL_glmnet$beta)) 
+# plots the estimates for all different lambdas; numbers refer to the order of coefficients
+plot(MTPL_glmnet, xvar = 'lambda', label =TRUE)    
+```
+
+The above plot has the coefficient estimates on the y-axis for each $\lambda$ value on the x-axis. For a higher $\lambda$, more coefficients are estimated to be 0. Interesting to see is that the `BM` coefficient is the last one to be put to 0, indicating its strong predictive power.
+
+# Choosing $\lambda$ and refit
+
+However, it is a priori unclear how to choose a correct value for $\lambda$. One way to do this is via $k$-fold cross-validation. This strategy partitions the data into $k$ disjoint sets (or: folds). For every fold, the model performance is then evaluated on that fold after fitting the model using the combined $k-1$ other folds as input data. The optimal $\lambda$ is then determined by minimizing a performance criterion (e.g. the average deviance or mean squared error over all folds) or is the highest $\lambda$ for which the performance criterion is within one standard deviation of this minimum. This last strategy is refered to as the 'one standard error rule'.
+
+Fortunately, this whole procedure is already present in the `glmnet` package through the `cv.glmnet` function. You apply this procedure to our MTPL data for 10 folds and the Poisson deviance as error measure. Note that the code below might take up to a few minutes to run.
+
+<!-- ```{r make reproducible, echo = TRUE, include = FALSE} -->
+<!-- set.seed(630124) -->
+<!-- ``` -->
+
+```{r cv.glmnet1}
+# to make results reproducible, fix the random number seed and the allocation of the observations to the different folds
+set.seed(942045)
+foldid <- sample(rep(1:10, length.out = nrow(MTPL)), nrow(MTPL))
+
+MTPL_glmnet_cv <- cv.glmnet(x, y, family = "poisson", alpha = 1, nfolds = 10, foldid = foldid, type.measure = "deviance", standardize = TRUE, intercept = TRUE)
+plot(MTPL_glmnet_cv)
+```
+
+The above plot shows the evolution of the deviance over the folds for the different values of $\lambda$ under consideration. The $\lambda$ such that the average deviance (red dots) is minimal is a possible choice. Another option is the highest value of $\lambda$ where the average deviance is within one standard deviation (error bars in plot above) of this minimum. This second option will lead to more sparse and interpretable models. The following code gives the estimated coefficients for those two values of lambda.
+
+```{r cv.glmnet2}
+MTPL_glmnet_cv$lambda.min
+coef(MTPL_glmnet_cv, s = "lambda.min")
+MTPL_glmnet_cv$lambda.1se
+coef(MTPL_glmnet_cv, s = "lambda.1se")
+```
+
+In the case of the lambda with the minimal deviance, the coefficients for monthly payment frequency and the omnium types of coverage are set to 0. For the one-standard-error rule, a lot of binary features are removed from the model (`SEX`, `SPORT`, `FLEET`, `MONOVOL`, `FOUR`, `USE`) as well as the age of the car and the type of coverage. Additionally, both the coefficients for biyearly and monthly premium payments are set to 0. As such, the Lasso penalty enables the removal of coefficients and features from a model while simultaneously allowing the estimation of the other coefficients. A drawback in some cases is that these other, non-zero coefficients will be biased towards 0 due to the same Lasso penalty. In many cases, it can therefore be advantageous to find the non-zero coefficients with the Lasso penalty and plug them back in a standard GLM to find non-biased coefficients. For example, compare the penalized coefficients above with the GLM coefficients below for the variables selected throught the cross-validation with one standard error rule. You will see that the resulting coefficients are now all statistically relevant.
+
+```{r refit1}
+library(plyr)
+# first we need to recode the PAYFREQ variable:
+MTPL$PAYFREQ    <- revalue(MTPL$PAYFREQ, c("biyearly" = "bi+month", "monthly" = "bi+month")) # to merge these levels
+MTPL$PAYFREQ    <- relevel(MTPL$PAYFREQ, "bi+month") # to make this the reference category
+
+# now we can put the relevant variables in a GLM
+MTPL_formula_refit <- NCLAIMS ~ 1 + AGEPH + BM + POPUL + PAYFREQ + FUEL + POWER
+MTPL_glm_refit <- glm(MTPL_formula_refit, data = MTPL, offset = log(MTPL$DURATION), family = poisson())
+summary(MTPL_glm_refit)
+```
+
+```{r, eval=FALSE}
+# this code can be used to extract the R code from an R Markdown (Rmd) document
+library(knitr)
+setwd(path)
+file.exists("2019-05-13 Building sparse GLMs.Rmd")
+purl("2019-05-13 Building sparse GLMs.Rmd")
+```

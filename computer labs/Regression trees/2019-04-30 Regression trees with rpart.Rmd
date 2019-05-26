@@ -1,0 +1,361 @@
+---
+title: "Regression trees for modelling insurance data"
+author: "Katrien Antonio"
+date: "April 2019"
+output:
+  html_document:
+    theme: spacelab
+    toc: yes
+    toc_depth: 2
+    toc_float:
+      collapsed: yes
+      smooth_scroll: yes
+  pdf_document: default
+  word_document: default
+graphics: yes
+---
+
+
+```{r, include=FALSE}
+# overall knitr options
+knitr::opts_chunk$set(cache = FALSE, echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# Goal of the demo
+
+This demo demonstrates the basic principles of fitting claim frequency data with tree-based methods. In particpular: focus is on the use of regression trees with `rpart`. The code is based on lecture sheets developed by prof. Julien Trufin on 'Machine learning techniques in non-life insurance ratemaking' and on the lecture notes by prof. Mario Wüthrich on 'Data analytics for non-life insurance pricing'. A detailed use case on modelling claim frequency as well as severity data with regression trees is documented in the paper [https://arxiv.org/abs/1904.10890](Boosting insights in insurance tariff plans with tree-based machine learning) by Roel Henckaerts, Katrien Antonio, Marie-Pier Côté (Université de Laval, Canada) and Roel Verbelen.
+
+You put focus on fitting regression trees with the R package `rpart`. The name of this package refers to the 'recursive partitioning' technique that is used to build a tree.  The package implements many
+of the ideas found in the CART (Classification and Regression Trees) book and programs of Breiman, Friedman, Olshen and Stone. Because CART is the trademarked name of a particular software implementation of these ideas, and tree has been used for the SPlus routines of Clark and Pregibon a different acronym - Recursive PARTitioning or rpart - was chosen.
+
+# Basic concepts illustrated on simulated data
+
+## Generating the data
+
+You simulate a data set of claim frequencies to illustrate the basic instructions. To replicate the results of the demo, you should first specify a `seed`.
+
+```{r set_seed}
+set.seed(1)
+```
+In `R` the instruction `set.seed()` is the recommended way to specify seeds. This sets the seed of `R`'s random number generator, which is useful for creating simulations or random objects that can be reproduced.
+
+You generate a data set of size `n`, in this case: 500 000 records are generated. 
+
+```{r set_n}
+n <- 500000 # number of observations
+```
+
+Covariates in the artificial data set are: `Gender`, `Age`, `Split` and `Sport`. You generate their values as follows: 
+
+```{r generate_covariates}
+Gender <- factor(sample(c("m", "f"), n, replace = TRUE))
+Age <- sample(c(18:65), n, replace = TRUE)
+Split <- factor(sample(c("yes", "no"), n, replace = TRUE))
+Sport <- factor(sample(c("yes", "no"), n, replace = TRUE))
+```
+
+***
+**Exercise**: 
+
+* put the generated vectors `Gender`, `Age`, `Split` and `Sport` together in a data frame and inspect this data frame.
+
+***
+
+You now specify the mean of the Poisson distribution that will be used to generate the claim frequency data 
+\begin{eqnarray*}
+N_i &\sim& \text{POI}(\lambda_i)  \\
+\lambda_i &=& \exp{(\boldsymbol{x}_i^{'} \cdot \boldsymbol{\beta})}.
+\end{eqnarray*}
+In this expression you let the mean of the Poisson distribution depend on the covariates in the following way.
+
+```{r specify_lambda}
+lambda <- 0.1*ifelse(Gender == "m", 1.1, 1)
+lambda <- lambda*ifelse(Age >= 18 & Age < 30, 1.4, 1)
+lambda <- lambda*ifelse(Age >= 30 & Age < 45, 1.2, 1)
+lambda <- lambda*ifelse(Sport == "yes", 1.15, 1)
+```
+
+Thus, the expected claim frequency depends on `Age`, `Gender` and `Sport`, but not on `Split`. As a final step in generating the data, you randomly pick observations from a Poisson distribution with the specified vector `lambda` as the mean. You store the resulting, artificial data set in the object `data`.
+
+```{r generate_poisson_data}
+N <- rpois(n, lambda)
+data <- data.frame(N, Gender, Age, Sport, Split)
+```
+
+***
+**Exercise**: 
+
+* using the `%>%` operator check the empirical claim frequency per gender, age, etc
+* using the `%>%` operator check the empirical claim frequency for combined levels of gender, age, et cetera.
+
+***
+
+## Algorithmic essentials behind `rpart`
+
+In this tutorial you will use the `R` package `rpart`. Make sure to install and to load the package before actually using it.
+
+```{r load_rpart}
+# install.packages("rpart")
+library(rpart)
+```
+
+The basic function call in `rpart` is structured as follows
+
+```{r, eval=FALSE}
+rpart(formula, data, weights, subset, na.action = na.rpart, method,
+model = FALSE, x = FALSE, y = TRUE, parms, control, cost, ...)
+```
+
+Here are some highlights related to the main arguments used in the basic function call:
+
+* `formula` the model formula, as in `lm` and other `R` model fitting functions. The right hand side may contain both continuous and categorical (factor) terms. The left hand side is the outcome that should be modelled.
+* `method`: the type of splitting rule to use. The different methods available (at this point) are `anova`, `poisson`, `class` or `exp` (for survival data). You will use `poisson` for the analysis of claim count data. The lecture notes by prof. Wüthrich provide an interesting discussion of this method in Chapter 6.
+* `control`: a list of control parameters, among others:
+  + `minsplit`:  the minimum number of observations in a node for which the routine will even try to compute a split. The default is 20.
+  + `xval`: the number of cross-validations to be done. Usually set to zero during exploratory phases of the analysis.
+  + `maxdepth`: the maximum depth of any node of the final tree, with the root node counted as depth 0.
+  + `cp`: the threshold complexity parameter.
+A more detailed discussion of the control parameters used in `rpart` is https://stat.ethz.ch/R-manual/R-devel/library/rpart/html/rpart.control.html. A long introduction to the `rpart` functionalities is available from https://cran.r-project.org/web/packages/rpart/vignettes/longintro.pdf, in which Section 7 is covering regression and Section 8 puts focus on Poisson regression (as in our case). 
+
+Recall from the lecture sheets discussing regression trees that CART is using cost complexity pruning. That is: for a given value of $\alpha$ we look for the smallest tree $T_{\alpha}$ that minimizes
+\[\sum_{j=1}^J  \sum_{i:\ x_i \in R_j} \mathcal{L}(y_i, \hat{y}_{R_j})+ \alpha \cdot |T|,\]
+where the first term in this expression is the so-called risk of a tree $T$ (with regions $R_1, \ldots, R_J$) and $|T|$ is the number of terminal nodes in the tree (here: $J$ for a tree splitting the feature space into $J$ regions). Obviously, $T_0$ is then the full model (i.e. a very large tree, the biggest one allowed by the stopping criterion) and $T_{\infty}$ is the root tree, i.e. a model with no splits at all. In the `rpart` package a scaled version of this cost-complexity approach is used. For a given value of `cp`, the cost complexity parameter used in `rpart`, we look for the smallest tree that minimizes
+\[\sum_{j=1}^J \sum_{i:\ x_i \in R_j} \mathcal{L}(y_i, \hat{y}_{R_j}) + \text{cp} \cdot |T| \cdot \sum_{i:\ x_i \in R} \mathcal{L}(y_i, \hat{y}_R),\]
+where the last sum evaluates the loss function for the root tree (that is: a tree with no splits). A large (small) value for `cp` puts a high (low) penalty on extra splits and will result in a small (large) tree. The connection between $\alpha$ and `cp` is $\frac{\alpha}{\sum_{i:\ x_i \in R} \mathcal{L}(y_i, \hat{y}_R)}$. The original tuning parameter $\alpha$ in the CART cost complexity criterion is scaled with the loss function evaluated for the root tree.  This ensures
+that `cp = 1` delivers a root tree without splits that captures an overall `y` estimate and `cp = 0`
+results in the biggest possible tree that the stopping criterion allows.
+
+As documented in Chapter 8 of https://cran.r-project.org/web/packages/rpart/vignettes/longintro.pdf and discussed extensively in [https://arxiv.org/abs/1904.10890](Boosting insights in insurance tariff plans with tree-based machine learning) modeling claim frequency data requires the use of an appropriate loss function. For frequency data you will use the Poisson deviance, defined as follows:
+\begin{align}
+D(y,f(\boldsymbol{x})) & = 2 \ln \prod_{i=1}^{n} \exp(-y_i)\frac{y_i^{y_i}}{y_i!} - 2 \ln \prod_{i=1}^{n} \exp\{-f(\boldsymbol{x}_i)\}\frac{f(\boldsymbol{x}_i)^{y_i}}{y_i!} \notag \\
+& = 2 \sum_{i=1}^{n} \left[ y_i \ln \frac{y_i}{f(\boldsymbol{x}_i)} - \{y_i - f(\boldsymbol{x}_i)\} \right].
+\label{poiss_dev}
+\end{align}
+When using an exposure-to-risk measure $e_i$, $f(\boldsymbol{x}_i)$ is replaced by $e_i \times f(\boldsymbol{x}_i)$ such that the exposure is taken into account in the expected number of claims. This allows the Poisson deviance loss function to account for different policy durations. Predictions from a Poisson regression tree are then equal to the sum of the number of claims divided by the sum of exposure for all training observations in each leaf node: $\hat{y}_{R_j} = \sum_{i\in I_j}N_i / \sum_{i\in I_j} e_i$ for $I_j = \{i: \boldsymbol{x}_i\in R_j\}$. This optimal estimate is obtained by setting the derivative of the Poisson deviance with respect to $f$ equal to zero.
+
+The tree is built by searching the split that results in the largest drop in deviance ($\Delta D$), where $\Delta D = D_{\text{parent}} - (D_{\text{left son}} + D_{\text{right son}})$.
+
+## Some first explorations 
+
+You first explore two basic calls of `rpart`: one where `cp=1` (no splitting) and one where `cp=0` (very much overfitting the data, as no penalty for complexity is included).
+
+```{r tree_with_cp_1}
+tree_cp_1 <- rpart(N ~ Gender + Age + Split + Sport, data = data, method = "poisson", control = rpart.control(cp = 1, maxdepth = 5))
+tree_cp_1
+summary(tree_cp_1)
+```
+With `cp=1` no splits are considered. In the `summary` of the resulting tree the `events` refer to the number of claims observed, here that is 
+
+```{r}
+sum(data$N)
+```
+
+and `estimated rate` refers to $\hat{\lambda}$ which is here calculated as
+
+```{r}
+sum(data$N)/n
+```
+
+The `mean deviance` is the residual deviance of the model considered, divided by its degrees of freedom (i.e. number of observations minus number of leaf nodes). Here that is (where I would expect minus 1 instead of minus 0)
+
+```{r}
+279043.3/(500000-0)
+```
+
+Now, you move to the call where you put the complexity parameter `cp=0`. This will overfit the data, since you grow a very large tree that is not penalized for complexity. 
+
+```{r tree_with_cp_0}
+tree_cp_0 <- rpart(N ~ Gender + Age + Split + Sport, data = data, method = "poisson", control = rpart.control(cp = 0, maxdepth = 5))
+tree_cp_0
+```
+
+Variable `node)` denotes the nodes of the tree, `split` denotes the split criterion applied, `n` denotes the number of cases in that node; `deviance` the resulting deviance statistic of that node; `yval` the
+frequency estimate of that node; and `*` whether the node is a leaf or not. 
+
+***
+**Exercise**: 
+
+* using the `%>%` operator verify the empirical claim frequency listed for any of the nodes in the tree constructed above.
+
+***
+
+For example, when solving the above exercise you may put focus on node 32 in the `tree_cp_0` tree. Training observations in this node have the following empirical claim frequency
+
+```{r}
+#install.packages("dplyr")
+library(dplyr)
+data %>% filter(Age >= 44.5, Sport == "no", Gender == "f", Split == "yes", Age < 64.5) %>% 
+  summarize(claim_freq_split = sum(N)/n())  
+```
+
+Thus, the empirical claim frequency of observations in node 32 is `0.09712899`. However, the summary of `tree_cp_0` prints an estimate equal to `0.09713895`. Where is this difference coming from? As explained in the caption of Table 1 in Henckaerts et al. (2019) and on pages 42-43 of Therneau et al. (1997) `rpart` assumes a gamma prior for the Poisson rate parameter to keep it from becoming zero when no claims occur in a node. The parameter `shrink` is the coefficient of variation of this gamma distributed random effect. By default it is equal to 1. If the `shrink` parameter becomes larger, the estimates reported for the nodes will converge to the MLEs, i.e. the number of claims in the node divided by the corresponding exposure. Run the following code to see this:
+
+```{r}
+tree_cp_0_star <- rpart(N ~ Gender + Age + Split + Sport, data = data, method = "poisson", parms = list(shrink = 10), control = rpart.control(cp = 0, maxdepth = 5))
+tree_cp_0_star
+```
+
+The estimate for node 32 is now `0.09712909`, closer to the MLE of `0.09712899`. Returning to the original fitted tree `tree_cp_0` the estimate for node 32 is in fact obtained as follows
+\begin{eqnarray*}
+\hat{\lambda}_j &=& \frac{\alpha + \sum_{i:\boldsymbol{x}_i\in R_j}k_i}{\beta + \sum_{i:\boldsymbol{x}_i\in R_j} e_i}, 
+\end{eqnarray*}
+where a Gamma($\mu$,\ $\sigma$) prior is used with coefficient of variation $k=\sigma/\mu$, $\alpha = 1/k^2$ and $\beta = \alpha/\hat{\lambda}_0$. $\hat{\lambda}_0$ is the overall mean claim frequency.
+
+```{r}
+lambda_0 <- sum(data$N)/n
+lambda_0
+test <- data %>% filter(Age >= 44.5, Sport == "no", Gender == "f", Split == "yes", Age < 64.5) %>% 
+  summarize(claims_node_32 = sum(N), exp_node_32 = n())
+lambda_32 <- (1 + test$claims_node_32)/(1/lambda_0 + test$exp_node_32)
+lambda_32
+```
+Now the value of `lambda_32` coincides with the estimate printed in the summary of `tree_cp_0`, equal to `0.09713895`
+
+If you call a `summary` of a tree, you get (among others) the output of the `printcp` function (to be discussed below). The `summary` also shows you the importance of each of the variables (which can be be extracted with `variable.importance`). In this example: `Age` is the most important feature, followed by `Sport` and `Gender`. `Split` is not important. 
+
+```{r}
+summary(tree_cp_0)
+tree_cp_0$variable.importance
+round(100*tree_cp_0$variable.importance/sum(tree_cp_0$variable.importance), digits = 0)
+```
+
+You can visualize the resulting tree with the following instructions.
+
+```{r visualize_tree_partykit}
+# plot tree
+# install.packages(`partykit')
+library(partykit) # package to produce plots for rpart trees
+tree_cp_0_party <- as.party(tree_cp_0)
+plot(tree_cp_0_party)
+```
+
+## Tree pruning with `rpart`
+
+Before pruning this tree, you can play a bit with the cost complexity parameter `cp`. For example, the tree obtained with `cp = 0.00005` identifies all relevant features, whereas the tree obtaind with `cp = 0.0002` is missing the feature `Gender` (which is important as we let $\lambda$ depend on this feature in the simulated data set).
+
+```{r}
+tree_cp_0.00005 <- rpart(N ~ Gender + Age + Split + Sport, data = data, method = "poisson", control = rpart.control(cp = 0.00005, maxdepth = 5))
+summary(tree_cp_0.00005)
+# plot tree
+tree_cp_0.00005_party <- as.party(tree_cp_0.00005)
+plot(tree_cp_0.00005_party)
+
+# fit model with cp=0.0002
+tree_cp_0.0002 <- rpart(N ~ Gender + Age + Split + Sport, data = data, method = "poisson", control = rpart.control(cp = 0.0002, maxdepth = 5))
+summary(tree_cp_0.0002)
+# plot tree
+tree_cp_0.0002_party <- as.party(tree_cp_0.0002)
+plot(tree_cp_0.0002_party)
+```
+
+The next step is to pick a meaningful value for the regularization or tuning parameter `cp` that determines the trade-off between goodness of fit and complexity of the tree. With the standard functionalities in `rpart` you call `printcp` applied to a very large tree, e.g. the one stored in `tree_cp_0`.
+
+```{r}
+printcp(tree_cp_0)
+plotcp(tree_cp_0)
+```
+
+The column labeled `CP` is the complexity parameter as discussed above. It serves as a penalty term to control tree size and is always monotonic with the number of splits (`nsplit`). The smaller the value of `CP`, the more complex will be the tree (the greater the number of splits). The last line in the output printed by `printcp` corresponds to the given cost complexity parameter (here: `cp = 0`). This control variable says that the tree growing algorithm should be stopped as soon as the cost-complexity parameter `cp` has reached that value. The lecture notes by prof. Wüthrich (pages 84-86) explain how the grid of cost complexity parameters is calculated. 
+
+The table also prints the `rel error`, the `xerror` and the `xstd`. Each split leads to a reduction in total deviance. At the root (null) node the residual deviance is `279043` in this example. After the first split the total deviance is reported to be (see the `tree_cp_0` printed above, check nodes 2 and 3)
+
+```{r}
+111779.7000 + 166261.4000
+```
+
+so the deviance has been reduced by splitting on the variable `Age`. At each stage of the tree we can sum the deviances at all the terminal nodes and compare it to the deviance at the root node to obtain an `R2`, the fraction of the original residual deviance that has been explained by the tree.
+
+```{r}
+(111779.7000 + 166261.4000)/279043
+```
+
+Thus, the relative error (`rel error`) is the deviance of the 'current' tree divided by the deviance of the null tree. It always goes down when the tree grows and more splits are added. Hence, it is not a good measure to tune the regularization parameter `cp`. This cost complexity parameter should instead be tuned with cross-validation. By default, `rpart` uses 10-fold cross validation, as the control parameter `xval` is equal to 10 by default, see `help(rpart.control)`. The cross-validation error is again measured relative to the deviance of the null model. Each of the trees corresponding to a line in the `printcp` table is examined using 10-fold cross-validation, in which the data are divided into 10 equal segments; the tree is built using 9 of the 10 segments, and the error is assessed on the tenth segment. This is repeated leaving off each fold in turn and errors are then averaged and scaled to give `xerror`. The `xstd` is the variation between the 10 (subsample) error estimates calculated as such.
+
+Because the cross-validation error results are random, it is a good idea to specify the `set.seed` function to set the seed for the random number stream so that the results obtained are reproducible (like you did in the beginning of this tutorial). Two widely used techniques to tune the regularization parameter are then: 
+
+  * use the first level (i.e. least `nsplit`) with minimum `xerror`. 
+
+  * use the first level where `xerror` falls into the ±1 `xstd` range of `min(xerror)`, i.e. `xerror < min(xerror) + xstd`, where `xstd` is the standard deviation that corresponds with the `min(xerror)`. This method takes into account the variability of `xerror` resulting from cross-validation.
+
+In this demo, you will extract the value of `cp` that minimizes the cross-validation error with the following instruction
+
+```{r}
+c_opt <- tree_cp_0$cptable[which.min(tree_cp_0$cptable[,"xerror"]),"CP"]
+c_opt
+```
+
+As a final step, you prune the large tree stored in `tree_cp_0` to obtain an optimal regression tree for `data`.
+
+```{r}
+tree_opt <- prune(tree_cp_0, cp = c_opt)
+tree_opt <- as.party(tree_opt)
+plot(tree_opt)
+```
+
+Now that you calibrated an optimal tree on this data set, you can use it to predict the risk profiles in the data. As usual in `R`, `rpart` comes with a `predict` function:
+
+```{r}
+lambda_hat <- predict(tree_opt) 
+data$lambda_hat <- lambda_hat
+head(data)
+```
+
+You now extract the rules implied by the final tree with the following instructions: 
+
+```{r}
+class <- partykit:::.list.rules.party(tree_opt)
+data$class <- class[as.character(predict(tree_opt, type = "node"))]
+head(data)
+```
+
+All unique risk profiles implied by the final tree are then obtained as follows: 
+
+```{r}
+s <- subset(data, select = c(lambda_hat, class))
+
+s <- unique(s)
+
+s[order(s$lambda_hat), ]
+```
+
+***
+**Exercise**: 
+
+* specify a new risk profile (in terms of the covariates `Age`, `Sport`, `Gender` and `Split`) and predict the corresponding claim frequency using the optimal tree stored in `tree_opt`.
+
+***
+
+The demo relies on the built-in `rpart` tuning strategies. More tailor-made tuning strategies are illustrated in [https://arxiv.org/abs/1904.10890](Boosting insights in insurance tariff plans with tree-based machine learning). 
+
+# Fitting the MTPL data set
+
+Now it is your turn to grow a regression tree for the MTPL data set that was used earlier in the course. 
+
+You load the data
+
+```{r}
+path <- file.path('C:/Users/u0043788/Dropbox/IIR Machine learning en Data Science opleiding/R demos/Pricing analytics')
+path.MTPL <- file.path(path, "P&Cdata.txt")
+path.MTPL
+DT <- read.table(path.MTPL, header = TRUE)
+DT <- as.data.frame(DT)
+head(DT)
+```
+
+and start building a regression tree (using a selection of the available covariates)
+
+```{r}
+tree <- rpart( cbind(EXP, NCLAIMS) ~ AGEPH + POWER + FUEL + SEX + COVERAGE + USE + FLEET, data = DT, method="poisson", control = rpart.control(cp = 0, maxdepth = 5)) 
+printcp(tree) 
+```
+
+Examine the stability of regression trees by building optimal trees on two different subsets of the data (of equal size).
+
+```{r, eval=FALSE}
+# this code can be used to extract the R code from an R Markdown (Rmd) document
+library(knitr)
+setwd('C:/Users/u0043788/Dropbox/Data science for non-life insurance/Computer labs/Regression trees')
+file.exists("2019-04-30 Regression trees with rpart.Rmd")
+purl("2019-04-30 Regression trees with rpart.Rmd")
+```
+

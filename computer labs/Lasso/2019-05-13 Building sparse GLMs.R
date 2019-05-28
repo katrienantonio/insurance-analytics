@@ -2,8 +2,50 @@
 # overall knitr options
 knitr::opts_chunk$set(cache = FALSE, echo = TRUE, warning = FALSE, message = FALSE)
 
+## ----load_glmnet---------------------------------------------------------
+library(glmnet)
+
+## ----load_linear_regr_data-----------------------------------------------
+path <- "C:/Users/u0043788/Dropbox/Arcturus Neural Nets/Computer labs/Lasso"
+quickstart.path <- file.path(path, "QuickStartExample.RData")
+load(quickstart.path)
+
+## ----basic_fit_glmnet----------------------------------------------------
+fit <- glmnet(x, y)
+
+## ----plot_coef-----------------------------------------------------------
+plot(fit)
+
+## ----plot_coef_label-----------------------------------------------------
+plot(fit, label = TRUE)
+
+## ----plot_coef_xvar_label------------------------------------------------
+plot(fit, xvar = 'lambda', label = TRUE)
+plot(fit, xvar = 'dev', label = TRUE)
+
+## ----print_fit-----------------------------------------------------------
+print(fit)
+
+## ----pick_s--------------------------------------------------------------
+coef(fit, s = 0.1)
+
+## ----cv_glmnet-----------------------------------------------------------
+cvfit <- cv.glmnet(x, y)
+
+## ----plot_cvfit----------------------------------------------------------
+plot(cvfit)
+
+## ----lambda_min----------------------------------------------------------
+cvfit$lambda.min
+
+## ----coef_lambda_min-----------------------------------------------------
+coef(cvfit, s = "lambda.min")
+
+## ----predict-------------------------------------------------------------
+predict(cvfit, newx = x[1:5,], s = "lambda.min")
+
 ## ----load_data_set-------------------------------------------------------
-path <- "C:/Users/u0043788/Dropbox/APC Module Data Science/R demos/Lasso"
+path <- "C:/Users/u0043788/Dropbox/Arcturus Neural Nets/Data"
 MTPL.path <- file.path(path, "P&Cdata_extended.txt")
 MTPL <- read.table(MTPL.path)
 head(MTPL)
@@ -69,7 +111,8 @@ summary(MTPL_glm_refit)
 ## ---- eval=FALSE---------------------------------------------------------
 ## # this code can be used to extract the R code from an R Markdown (Rmd) document
 ## library(knitr)
+## path <- "C:/Users/u0043788/Dropbox/Arcturus Neural Nets/Computer labs/Lasso"
 ## setwd(path)
-## file.exists("2018-09-25 Building sparse GLMs.Rmd")
-## purl("2018-09-25 Building sparse GLMs.Rmd")
+## file.exists("2019-05-13 Building sparse GLMs.Rmd")
+## purl("2019-05-13 Building sparse GLMs.Rmd")
 

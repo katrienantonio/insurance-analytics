@@ -21,20 +21,143 @@ graphics: yes
 knitr::opts_chunk$set(cache = FALSE, echo = TRUE, warning = FALSE, message = FALSE)
 ```
 
-# Introduction
+# Introducing the `glmnet` package
 
-You now focus on predicting the expected claim frequency for a Motor Third Party Liability (MTPL) portfolio. You can load this data set into `R` using the following code.
+`glmnet` is a package that fits a generalized linear model via penalized maximum likelihood. The regularization path is computed for the lasso or elasticnet penalty at a grid of values for the regularization parameter `lambda`. The package fits linear, logistic
+and multinomial, poisson, and Cox regression models. For a detailed discussion we refer to the [https://web.stanford.edu/~hastie/glmnet/glmnet_alpha.html](vignette). This text is followed closely in the first illustration in this tutorial; full credits go to the authors of this package and the vignette.
+
+`glmnet` solves the following minimization problem (with $n$ the number of observations)
+\begin{eqnarray*}
+\min_{\beta_0,\boldsymbol{\beta}} -\frac{1}{n} \sum_{i=1}^n \mathcal{L}(\beta_0,\boldsymbol{\beta}; y_i, \boldsymbol{x}_i)+\lambda P_{\alpha}(\boldsymbol{\beta}).
+\end{eqnarray*}
+Here $\mathcal{L}$ is the log-likelihood of a GLM, and the penalty
+\begin{eqnarray*}
+\lambda P_{\alpha}(\boldsymbol{\beta}) = \lambda \cdot \sum_{j=1}^p \left\{\frac{(1-\alpha)}{2}\beta_j^2 + \alpha |\beta_j|\right\},
+\end{eqnarray*}
+with $p$ the dimension of the input vector, $\alpha \in [0,1]$ the elastic-net parameter (to mix ridge and lasso). The tuning parameter $\lambda$ controls the overall strength of the penalty.
+
+It is known that the ridge penalty shrinks the coefficients of correlated predictors towards each other while the lasso tends to pick one of them and discard the others. The elastic-net penalty mixes these two; if predictors are correlated in groups an $\alpha = 0.5$ ends to select the groups in or out together. This is a higher level parameter, and users might pick a value upfront, else experiment with a few different values. 
+
+The package also includes methods for prediction and plotting, and a function that performs K-fold cross-validation.
+
+# First principles illustrated with linear regression
+
+We discuss the general sense of the package, including the components, what they do and some basic usage. First, we load the `glmnet` package
+
+```{r load_glmnet}
+library(glmnet)
+```
+
+The default model used in the package is the Guassian linear model or “least squares”, which we will demonstrate in this section to cover the basic principles of the package.
+
+We load a set of data created beforehand for illustration. 
+
+```{r load_linear_regr_data}
+path <- "C:/Users/u0043788/Dropbox/Arcturus Neural Nets/Computer labs/Lasso"
+quickstart.path <- file.path(path, "QuickStartExample.RData")
+load(quickstart.path)
+```
+
+The command loads an input matrix `x` and a response vector `y`.
+
+We fit the model using the most basic call to `glmnet`
+
+```{r basic_fit_glmnet}
+fit <- glmnet(x, y)
+```
+
+A more elaborate function call would work like this: `fit <- glmnet(x, y, alpha = , weights = , nlambda = , standardize = )`
+
+`glmnet` provides various options for users to customize the fit. We introduce some commonly used options here and they can be specified in the glmnet function.
+
+* `alpha` is for the elastic-net mixing parameter (cfr above).
+* `weights` is for the observation weights. Default is 1 for each observation. (Note: glmnet rescales the weights to sum to the sample size.)
+* `nlambda` is the number of $\lambda$
+values in the sequence. Default is 100.
+* `standardize` is a logical flag for `x` variable standardization, prior to fitting the model sequence. The coefficients are always returned on the original scale. Default is `standardize=TRUE`.
+
+We visualize the coefficients with the `plot` instruction
+
+```{r plot_coef}
+plot(fit)
+```
+
+Each curve corresponds to a variable. It shows the path of its coefficient against the $\ell_1$-norm of the whole coefficient vector as $\lambda$ varies. The axis above indicates the number of nonzero coefficients at the current $\lambda$, which is the effective degrees of freedom (df) for the lasso. Users may also wish to annotate the curves; this can be done by setting `label = TRUE` in the plot command.
+
+```{r plot_coef_label}
+plot(fit, label = TRUE)
+```
+
+Users can decide what is on the $x$-axis. `xvar` allows three measures: `norm` for the $\ell_1$ norm of the coefficients (default), `lambda` for the log-lambda value and `dev` for %deviance explained. The latter refers to: $D_{\lambda}^2 = \frac{\text{Dev}_{\text{null}}-D_{\lambda}}{D_{\text{null}}}$.
+
+```{r plot_coef_xvar_label}
+plot(fit, xvar = 'lambda', label = TRUE)
+plot(fit, xvar = 'dev', label = TRUE)
+```
+
+A summary of the `glmnet` path at each step is displayed if we just enter the object name or use the `print` function.
+
+```{r print_fit}
+print(fit)
+```
+
+It shows from left to right the number of nonzero coefficients (`Df`), the percent (of null) deviance explained (`%dev`) and the value of $\lambda$. Although by default glmnet calls for 100 values of lambda the program stops early if `%dev%` does not change sufficently from one lambda to the next (typically near the end of the path.)
+We can obtain the actual coefficients at one or more $\lambda$'s within the range of the sequence:
+
+```{r pick_s}
+coef(fit, s = 0.1)
+```
+
+The function `glmnet` returns a sequence of models for the users to choose from. In many cases, users may prefer the software to select one of them. Cross-validation is perhaps the simplest and most widely used method for that task.
+
+```{r cv_glmnet}
+cvfit <- cv.glmnet(x, y)
+```
+
+We plot the object.
+
+```{r plot_cvfit}
+plot(cvfit)
+```
+
+It includes the cross-validation curve (red dotted line), and upper and lower standard deviation curves along the $\lambda$
+sequence (error bars). Two selected $\lambda$s are indicated by the vertical dotted lines (see below).
+
+We can view the selected $\lambda$'s and the corresponding coefficients. For example,
+
+```{r lambda_min}
+cvfit$lambda.min
+```
+
+`lambda.min` is the value of $\lambda$
+that gives minimum mean cross-validated error. The other $\lambda$ saved is `lambda.1se`, which gives the most regularized model such that error is within one standard error of the minimum. To use that, we only need to replace `lambda.min` with `lambda.1se` above.
+
+```{r coef_lambda_min}
+coef(cvfit, s = "lambda.min")
+```
+
+Note that the coefficients are represented in the sparse matrix format. The reason is that the solutions along the regularization path are often sparse, and hence it is more efficient in time and space to use a sparse format. 
+
+Predictions can be made based on the fitted `cv.glmnet` object. Let’s see a toy example.
+
+```{r predict}
+predict(cvfit, newx = x[1:5,], s = "lambda.min")
+```
+
+# Building a regularized Poisson GLM 
+
+## Loading the data
+
+You now focus on predicting the expected claim frequency for a Motor Third Party Liability (MTPL) portfolio. This is an extended version of the data set on MTPL you have been using before. You can load this data set into `R` using the following code.
 
 ```{r load_data_set}
-path <- "C:/Users/u0043788/Dropbox/APC Module Data Science/R demos/Lasso"
+path <- "C:/Users/u0043788/Dropbox/Arcturus Neural Nets/Data"
 MTPL.path <- file.path(path, "P&Cdata_extended.txt")
 MTPL <- read.table(MTPL.path)
 head(MTPL)
 ```
 
 This data set now lists info on 16 different variables for 163 234 policyholders. Your goal is to find which variables are relevant to explain the observed claim frequency such that you can build a sparse, interpretable, Generalized Linear Model (GLM).
-
-# A first look: Poisson GLM 
 
 You will first look at the names of all the variables in the data set.
 
@@ -75,7 +198,7 @@ summary(MTPL_GLM)
 
 Traditionally, one can use best subset selection to find the right features and coefficients for the predictive problem. However, for big data sets, this is often not feasible due to the number of possible feature combinations growing exponentially. You will now examine a more manageable alternative by using regularization.
 
-# A regularized Poisson GLM
+## A regularized Poisson GLM
 
 You will use the `glmnet` package in this demo. You can install the package using the following code.
 ```{r install_package_glmnet, eval = FALSE, include = TRUE}
@@ -111,7 +234,7 @@ plot(MTPL_glmnet, xvar = 'lambda', label =TRUE)
 
 The above plot has the coefficient estimates on the y-axis for each $\lambda$ value on the x-axis. For a higher $\lambda$, more coefficients are estimated to be 0. Interesting to see is that the `BM` coefficient is the last one to be put to 0, indicating its strong predictive power.
 
-# Choosing $\lambda$ and refit
+## Choosing $\lambda$ and refit
 
 However, it is a priori unclear how to choose a correct value for $\lambda$. One way to do this is via $k$-fold cross-validation. This strategy partitions the data into $k$ disjoint sets (or: folds). For every fold, the model performance is then evaluated on that fold after fitting the model using the combined $k-1$ other folds as input data. The optimal $\lambda$ is then determined by minimizing a performance criterion (e.g. the average deviance or mean squared error over all folds) or is the highest $\lambda$ for which the performance criterion is within one standard deviation of this minimum. This last strategy is refered to as the 'one standard error rule'.
 
@@ -153,9 +276,14 @@ MTPL_glm_refit <- glm(MTPL_formula_refit, data = MTPL, offset = log(MTPL$DURATIO
 summary(MTPL_glm_refit)
 ```
 
+# Lasso and friends: the `smurf` package
+
+For an introduction to the `smurf` package, please consult [its vignette](https://cran.r-project.org/web/packages/smurf/vignettes/smurf.html).
+
 ```{r, eval=FALSE}
 # this code can be used to extract the R code from an R Markdown (Rmd) document
 library(knitr)
+path <- "C:/Users/u0043788/Dropbox/Arcturus Neural Nets/Computer labs/Lasso"
 setwd(path)
 file.exists("2019-05-13 Building sparse GLMs.Rmd")
 purl("2019-05-13 Building sparse GLMs.Rmd")

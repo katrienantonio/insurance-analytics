@@ -1,0 +1,383 @@
+---
+title: "Building ANNs in R"
+author: "Katrien Antonio"
+date: "26 May 2019"
+output:
+  html_document:
+    theme: spacelab
+    toc: yes
+    toc_depth: 2
+    toc_float:
+      collapsed: yes
+      smooth_scroll: yes
+  bookdown::html_document2: default
+  pdf_document: default
+  word_document: default
+graphics: yes
+---
+
+```{r, include=FALSE}
+# overall knitr options
+knitr::opts_chunk$set(cache = FALSE, echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# Introduction
+
+In this tutorial you'll learn how to build an Artificial Neural Network (ANN) in R. The tutorial combines material from the following sources:
+
+* Tutorials on [https://keras.rstudio.com/articles/getting_started.html](RStudio's ``keras`` page)
+* Tutorials developed by prof. Taylor Arnold
+* DataCamp's [https://www.datacamp.com/community/tutorials/keras-r-deep-learning](keras: deep learning in R)
+
+All credits go to the authors of these contributions. The tutorials are closely followed here, because they provide a good practice to learn the basics of working with ``keras``.
+
+## R packages for deep learning
+
+You will use the ``keras`` package developed by RStudio. Next to the ``keras`` package, CRAN has many R deep learning packages. This [http://www.rblog.uni-freiburg.de/2017/02/07/deep-learning-in-r/](blog post) gives a nice discussion of some of these packages. Recently, two new packages found their way to the R community: the ``kerasR`` package, which was authored and created by Taylor Arnold, and RStudio’s ``keras`` package.
+Both packages provide an R interface to the Python deep learning package [https://keras.io/](Keras), “a high-level neural networks API, written in Python and capable of running on top of either TensorFlow, Microsoft Cognitive Toolkit (CNTK) or Theano”. More on Keras in [https://www.infoworld.com/article/3336192/what-is-keras-the-deep-neural-network-api-explained.html](this article). 
+
+## What is the difference between Keras (for Python), ``keras`` and ``kerasR``?
+
+The ``keras`` R package with the interface allows you to enjoy the benefit of R programming while having access to the capabilities of the Python Keras package. The latter is very popular because getting started with Keras is one of the easiest ways to get familiar with deep learning in Python. 
+
+So, how does the original Python package compare with the R packages?
+In essence, you won’t find too many differences between the R package and the original Python package, mostly because the function names are almost all the same. The only differences that you notice are mainly in the programming languages themselves (variable assignment, library loading, …), but the most important thing to notice lies in the fact of how much of the original functionality has been incorporated in the R package.
+
+The ``keras`` package uses the pipe operator (``%>%``) to connect functions or operations together, while you won’t find this in ``kerasR``. For example, to make your model with ``kerasR``, you’ll see that you need to make use of the ``$`` operator. The usage of the pipe operator generally improves the readability of your code, and you’ll have definitely seen this operator already if you’ve worked with ``tidyverse`` packages before.
+
+# Installing the ``keras`` package
+
+I recommend the following steps:
+
+* download and install Anaconda; make sure you select the right operating system
+* open an Anaconda prompt and install keras/tensorflow with the instruction
+``pip install keras``
+* install ``keras`` for R using 
+
+```{r get_keras_github, eval = F}
+install.packages("devtools")
+library(devtools)
+devtools::install_github("rstudio/keras")
+```
+* load the ``keras`` package. 
+
+# A first dense neural network 
+
+## Theory recap
+
+You will start with building a first example of a neural network. It has two hidden notes, denoted by $z$'s, which together form a hidden layer. The input layer has just one node, a single $x$, and the output has just one node, a single $w$. Essentially, we build up the $w$ as follows: 
+\begin{eqnarray*}
+z_1 &=& \alpha_1 + x \cdot \beta_1 \\
+z_2 &=& \alpha_2 + x \cdot \beta_2 \\
+w &=& \alpha_3 + \sigma(z_1)\cdot \gamma_1 + \sigma(z_2)\cdot \gamma_2,
+\end{eqnarray*}
+with $\sigma(.)$ the activation function used (e.g. ReLU). 
+
+This is a one-hidden layer network. It turns out that it can approximate any smooth function mapping $x$ to $w$ within an arbitrarily small precision.
+
+## Building the network
+
+### What about reproducibility?
+
+When you run the same ``keras`` instructions multiple times, results will be different due to the many random seeds used in each (Python) Keras layer, e.g. layers like dropout, initializers, etc. have randomness built in. When you want to avoid this, and reproducibility matters, the [https://keras.rstudio.com/articles/faq.html#how-can-i-obtain-reproducible-results-using-keras-during-development](following instructions) are probably helpful.
+
+```{r reproducible_keras}
+library(keras)
+use_session_with_seed(42)
+```
+
+### Load and explore the data
+
+To illustrate first principles, you will work on a very simple regression problem. The Boston Housing Prices dataset is accessible directly from ``keras``. This example builds a model to predict the median price of homes in a Boston suburb during the mid-1970s (in k$). To do this, we’ll provide the model with some data points about the suburb, such as the crime rate and the local property tax rate. 
+
+This tutorial is an annotated version of the [https://keras.rstudio.com/articles/tutorial_basic_regression.html](basic regression with keras in RStudio). I use it here as a good practice of building ANNs with `keras`.
+
+You will use the data set available in ``keras``. After loading the data, you have a list of train and test data at your disposal. 
+
+```{r load_boston_housing}
+boston_housing <- dataset_boston_housing()
+
+c(train_data, train_labels) %<-% boston_housing$train
+c(test_data, test_labels) %<-% boston_housing$test
+```
+
+`train_data` collects the features of the observations in the train set, `train_labels` their corresponding labels or targets. Similarly, `test_data` with the 13 features as stored for the test data and `test_labels` with their corresponding labels. In the code above surrounding a set of characters with flanking "%"-signs you can create your own vectorized infix function.
+
+This dataset is small: it has 506 total examples that are split between 404 training examples and 102 test examples:
+
+```{r print_size_data}
+paste0("Training entries: ", nrow(train_data), ", labels: ", nrow(train_labels))
+```
+The dataset contains 13 different features:
+
+* Per capita crime rate.
+* The proportion of residential land zoned for lots over 25,000 square feet.
+* The proportion of non-retail business acres per town.
+* Charles River dummy variable (= 1 if tract bounds river; 0 otherwise).
+* Nitric oxides concentration (parts per 10 million).
+* The average number of rooms per dwelling.
+* The proportion of owner-occupied units built before 1940.
+* Weighted distances to five Boston employment centers.
+* Index of accessibility to radial highways.
+* Full-value property-tax rate per $10,000.
+* Pupil-teacher ratio by town.
+* 1000 * (Bk - 0.63) ** 2 where Bk is the proportion of Black people by town.
+* Percentage lower status of the population.
+
+Each one of these input data features is stored using a different scale. Some features are represented by a proportion between 0 and 1, other features are ranges between 1 and 12, some are ranges between 0 and 100, and so on. A quick inspection of these features goes as follows
+
+```{r inspect_feature_scale}
+train_data[1, ]
+summary(train_data)
+```
+
+Let’s add column names for better data inspection.
+
+```{r inspect_features}
+str(train_data)
+column_names <- c('CRIM', 'ZN', 'INDUS', 'CHAS', 'NOX', 'RM', 'AGE', 
+                  'DIS', 'RAD', 'TAX', 'PTRATIO', 'B', 'LSTAT')
+train_df <- data.frame(train_data)
+colnames(train_df) <- column_names
+str(train_df)
+```
+
+The targets (or: labels) are the median house prices in thousands of dollars. (You may notice the mid-1970s prices.)
+
+```{r inspect_targets}
+train_labels[1:10]
+```
+
+### Normalize the features
+
+When building a neural network, it’s recommended to normalize features that use different scales and ranges. Although the model might converge without feature normalization, it makes training more difficult, and it makes the resulting model more dependant on the choice of units used in the input. You can use the function `scale` to center and scale the columns in the matrix with the train data. Storing the numeric centering and scaling as attributes allows to apply the same operation on the test data. 
+
+```{r normalize_features_training_test}
+# test data is *not* used when calculating the mean and std
+
+# normalize training data
+train_data <- scale(train_data) 
+
+# use means and standard deviations from training set to normalize test set
+col_means_train <- attr(train_data, "scaled:center") 
+col_stddevs_train <- attr(train_data, "scaled:scale")
+test_data <- scale(test_data, center = col_means_train, scale = col_stddevs_train)
+
+train_data[1, ] # first training sample, normalized
+```
+
+### Adding layers to a base empty model
+
+To build a model with keras, we first need to create a base empty model using the function ``keras_model_sequential``. This instruction initializes the sequential modelling strategy applied in `keras`.
+
+```{r create_base_model}
+model <- keras_model_sequential()
+```
+
+We then add layers using the `%>%` function. To replicate our very simple model above, we use `layer_dense`, which is just a plain vanilla set of neurons with no fancy logic inside of them. You’re looking to build a relatively simple stack of fully-connected layers to solve the predictive problem. The first layer, which contains 2 hidden notes, has an `input_shape` of 1. This is because your training data has 1 column. You then use the relu activation function, applied here as a seperate layer with no learned parameters. As for the activation functions that you will use, it’s best to use one of the most common ones here for the purpose of getting familiar with `keras` and neural networks. In addition, the identity function $a(x) = x$ is used in the output layer. You do this because you predict a continuous target. 
+
+```{r add_dense_layer}
+model %>%
+  layer_dense(units = 2, input_shape = c(1)) %>%
+  layer_activation(activation = "relu") %>%
+  layer_dense(units = 1)
+```
+
+Notice that printing the model gives a nice summary of all of the layers, the number of parameters in each layer, and the output shape that is fed into the next layer.
+
+```{r summary_model}
+model # or do: summary(model)
+model$layers
+model$input
+model$output
+```
+
+### Compiling the model
+
+Once the model has been built, you need to compile it before doing anything else with it. Here you set the loss, the thing you want to minimize, to the mean squared error, and set a particular algorithm for finding all of the best parameters. The `optimizer` and the `loss` are two arguments that are required if you want to compile the model. Some of the most popular optimization algorithms used are the Stochastic Gradient Descent (SGD), ADAM and RMSprop. Depending on whichever algorithm you choose, you’ll need to tune certain parameters, such as learning rate or momentum. The choice for a loss function depends on the task that you have at hand: for example, for a regression problem, you’ll usually use the Mean Squared Error (MSE).
+
+```{r compile_model}
+model %>% compile(
+  loss = 'mse',
+  optimizer = optimizer_rmsprop(),
+  metrics = c('mean_absolute_error')
+)
+```
+
+### Fitting the model to a dataset
+
+Once the model has been compiled you can actually fit it to the Boston housing dataset. You try to predict the median house price (the target or label) using only the per capita crime rate feature. You train the model for 5 epochs or iterations over all the samples in the training data set. You can also visualize the fitted model if you assign the lines of code to a variable.
+
+```{r fit_model}
+history <- model %>%
+  fit(train_data[ , 1], train_labels, epochs = 5,
+      validation_split = 0.2) # fraction of training data used as validation set
+```
+
+Notice that there is a lot of output that comes along with fitting a neural network. With the `plot` instruction you visualize the `loss` and `mse` as calculated on the training data over the various epochs, while the `val_loss` and `val_mse` are the same metrics, loss and mse, for the test or validation data.
+
+```{r plot_fit}
+plot(history)
+```
+
+You can also build up this graph from scratch as an attempt to understand better what is shown here. 
+
+```{r build_fit_plot}
+# Plot the model loss of the validation data
+plot(history$metrics$loss, main = "Model Loss", xlab = "epoch", ylab = "loss", col = "blue", type = "l")
+
+# Plot the model loss of the test data
+lines(history$metrics$val_loss, col = "green")
+
+# Add legend
+legend("topright", c("train", "test"), col = c("blue", "green"), lty = c(1,1))
+```
+
+Some things to keep in mind here are the following:
+
+* If your training data loss keeps decreasing while your validation data loss increases, you are overfitting: your model starts to just memorize the data instead of learning from it.
+* If the trend for loss on both datasets is still decreasing for the last few epochs, you can clearly see that the model has not yet over-learned the training dataset.
+
+### Predicted values
+
+You will use a prediction function to predict values from this model on new data. Notice that the learned relationship is more complex than a straightforward linear regression:
+
+```{r predict}
+test_data_pred <- model %>% predict(test_data[ , 1])
+library(ggplot2)
+qplot(test_data[ , 1], test_data_pred)
+```
+Obviously, this very simple neural network does not provide a good fit of the target.
+
+## Building larger models
+
+You can easily add more hidden layers with more variables. As an exercise, you will now build a model with two hidden layers, each with 8 neurons
+
+```{r}
+
+```
+
+At this point, neural networks should seem like a natural extension of the models we have already seen rather than a fancy black-box. 
+
+# Going further: more inputs, more neurons and more layers
+
+You'll continue using the Boston Housing Prices dataset is accessible directly from ``keras``. The tutorial below is an annotated version of the [https://keras.rstudio.com/articles/tutorial_basic_regression.html](basic regression with keras in RStudio). I use it here as a good practice of building ANNs with `keras`.
+
+## Loading and preparing the data
+
+This step is already covered above. If you jump in at this point, then you should first work through the instructions on loading and preparing the data set.
+
+## Create the model
+
+Let’s set up and compile our model. Here, we’ll use a sequential model with two densely connected hidden layers (using 64 hidden neurons), and an output layer that returns a single, continuous value. The input layer uses all 13 features available in the dataset. The model building steps are wrapped in a function, ``build_model``, since we’ll create a second model, later on.
+
+```{r build_model_function}
+build_model <- function() {
+  
+  model <- keras_model_sequential() %>%
+    layer_dense(units = 64, 
+                input_shape = dim(train_data)[2]) %>%
+    layer_activation(activation = "relu") %>%
+    layer_dense(units = 64) %>%
+    layer_activation(activation = "relu") %>%
+    layer_dense(units = 1)
+  
+  model %>% compile(
+    loss = "mse",
+    optimizer = optimizer_rmsprop(),
+    metrics = list("mean_absolute_error")
+  )
+  
+  model
+}
+
+model <- build_model()
+model %>% summary()
+```
+
+***
+**Exercise**: 
+
+* recalculate/explain the number of parameters trained in each layer.
+
+***
+
+## Compile and train the model
+
+The model is trained for 500 epochs, recording training and validation accuracy in a ``keras_training_history`` object. We also show how to use a custom callback, replacing the default training output by a single dot per epoch.
+
+```{r}
+epochs <- 500
+
+print_dot_callback <- callback_lambda(
+  on_epoch_end = function(epoch, logs) {
+    if (epoch %% 80 == 0) cat("\n")
+    cat(".")
+  }
+)
+
+# Fit the model and store training stats
+history <- model %>% fit(
+  train_data,
+  train_labels,
+  epochs = epochs,
+  validation_split = 0.2, # fraction of training data used as validation set
+  verbose = 0, # choose between 0 = silent, 1 = progress bar and 2 = one line per epoch
+  callbacks = list(print_dot_callback)
+)
+```
+
+Now, we visualize the model’s training progress using the metrics stored in the history variable. We want to use this data to determine how long to train before the model stops making progress.
+
+```{r}
+library(ggplot2)
+
+plot(history, metrics = "mean_absolute_error", smooth = FALSE) +
+  coord_cartesian(ylim = c(0, 5))
+```
+
+This graph shows little improvement in the model after about 200 epochs. Let’s update the fit method to automatically stop training when the validation score doesn’t improve. We’ll use a callback that tests a training condition for every epoch. If a set amount of epochs elapses without showing improvement, it automatically stops the training.
+
+```{r}
+# The patience parameter is the amount of epochs to check for improvement.
+early_stop <- callback_early_stopping(monitor = "val_loss", patience = 20)
+
+model <- build_model()
+history <- model %>% fit(
+  train_data,
+  train_labels,
+  epochs = epochs,
+  validation_split = 0.2,
+  verbose = 0,
+  callbacks = list(early_stop, print_dot_callback)
+)
+
+plot(history, metrics = "mean_absolute_error", smooth = FALSE) +
+  coord_cartesian(xlim = c(0, 150), ylim = c(0, 5))
+```
+
+Let’s see how did the model performs on the test set:
+
+```{r}
+c(loss, mae) %<-% (model %>% evaluate(test_data, test_labels, verbose = 0))
+
+paste0("Mean absolute error on test set: $", sprintf("%.2f", mae * 1000))
+```
+
+## Predict
+
+Finally, predict some housing prices using data in the testing set:
+
+```{r}
+test_predictions <- model %>% predict(test_data)
+test_predictions[ , 1]
+```
+
+
+This example introduced a few techniques to handle a regression problem with a neural network trained in ``keras``.
+
+* Mean Squared Error (MSE) is a common loss function used for regression problems (different than classification problems).
+* Similarly, evaluation metrics used for regression differ from classification. A common regression metric is Mean Absolute Error (MAE).
+* When input data features have values with different ranges, each feature should be scaled independently.
+* If there is not much training data, prefer a small network with few hidden layers to avoid overfitting.
+* Early stopping is a useful technique to prevent overfitting
